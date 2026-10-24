@@ -479,25 +479,9 @@ SHL.UI = (function () {
     if (cmd === 'retreat') { toast(L.name + ' 已下令向后方脱离（进入队列）', 'good'); SHL.Audio.confirm(); return; }
   }
 
-  /* 路径：BFS 最短道路 */
+  /* 路径：统一走规则层寻路（保证与军令校验同源） */
   function bfsPath(from, to) {
-    const T = D.theaterHuainan;
-    if (from === to) return [from];
-    const adj = {};
-    T.roads.forEach(([a, b]) => { (adj[a] = adj[a] || []).push(b); (adj[b] = adj[b] || []).push(a); });
-    const prev = {}, q = [from], seen = new Set([from]);
-    while (q.length) {
-      const cur = q.shift();
-      if (cur === to) break;
-      (adj[cur] || []).forEach(nx => {
-        if (!seen.has(nx)) { seen.add(nx); prev[nx] = cur; q.push(nx); }
-      });
-    }
-    if (!seen.has(to)) return [from, to];
-    const path = [to];
-    let c = to;
-    while (c !== from) { c = prev[c]; path.unshift(c); }
-    return path;
+    return State.findPath(from, to) || [from, to];
   }
 
   /* 行军预览浮窗 */
@@ -1022,12 +1006,12 @@ SHL.UI = (function () {
       mask.querySelectorAll('.proposal').forEach(x => x.classList.toggle('selected', x === el));
       $('#cv-confirm').disabled = false;
       $('#cv-cancel-p').disabled = false;
-      // 只绘制预览箭头
+      // 只绘制预览箭头（按当前节点寻路）
       const S2 = State.current();
       const p = ch.proposals.find(x => x.id === councilProposal);
-      if (p.id === 'A') SHL.Map3D.drawMarchArrow('scouts', bfsPath('dukou', 'dukou').length > 1 ? bfsPath('dukou', 'dukou') : ['camp', 'dukou', 'bagong'], 0x657C82);
-      if (p.id === 'B') SHL.Map3D.drawMarchArrow('transport', ['liangdao', 'reed', 'dukou'], 0x9C8665);
-      if (p.id === 'C') { SHL.Map3D.drawMarchArrow('transport', ['liangdao', 'reed', 'dukou'], 0x9C8665); SHL.Map3D.drawMarchArrow('beifu', ['camp', 'bagong', 'dukou'], 0x984C3F); }
+      if (p.id === 'A') SHL.Map3D.drawMarchArrow('scouts', bfsPath(S2.legions.scouts.node, 'dukou'), 0x657C82);
+      if (p.id === 'B') SHL.Map3D.drawMarchArrow('transport', bfsPath(S2.legions.transport.node, 'dukou'), 0x9C8665);
+      if (p.id === 'C') { SHL.Map3D.drawMarchArrow('transport', bfsPath(S2.legions.transport.node, 'dukou'), 0x9C8665); SHL.Map3D.drawMarchArrow('beifu', bfsPath(S2.legions.beifu.node, 'dukou'), 0x984C3F); }
       SHL.Audio.tick();
     }));
     $('#cv-cancel-p').addEventListener('click', () => {
@@ -1048,26 +1032,29 @@ SHL.UI = (function () {
       const S2 = State.current();
       const p = ch.proposals.find(x => x.id === councilProposal);
       S2.councilChosen = councilProposal;
-      /* —— 仅生成草案，不入队：明确下令时才校验并入队一次 —— */
+      /* —— 仅生成草案，不入队；路线按军团当前所在节点重新寻路 —— */
       const draft = { proposal: p.id, orders: [] };
       if (p.id === 'A') {
-        draft.orders.push({ kind: 'scout', legionId: 'scouts', label: '斥候乙队', grain: 20, turns: 1, from: 'dukou', to: 'dukou', fromName: '渡口', toName: '渡口', path: ['camp', 'dukou'], desc: '增派侦察，核实后再动' });
-        draft.text = `执行单位：斥候乙队<br>路线：东岸大营 → 渡口（往返）<br>时限：1回合<br>终止条件：回报核实或失联；失联则按过时情报处理`;
+        const pathA = State.findPath(S2.legions.scouts.node, 'dukou') || ['camp', 'dukou'];
+        draft.orders.push({ kind: 'scout', legionId: 'scouts', label: '斥候乙队', grain: 20, turns: 1, from: S2.legions.scouts.node, to: 'dukou', fromName: nodeName(S2.legions.scouts.node), toName: '渡口', path: pathA, desc: '增派侦察，核实后再动' });
+        draft.text = `执行单位：斥候乙队（现处${nodeName(S2.legions.scouts.node)}）<br>路线：${pathA.map(State.nodeName).join(' → ')}<br>时限：1回合<br>终止条件：回报核实或失联；失联则按过时情报处理`;
       } else if (p.id === 'B') {
-        const L = S2.legions.transport, step = L.stance === 'fast' ? 2 : 1;
-        const path = ['liangdao', 'reed', 'dukou'];
+        const L = S2.legions.transport;
+        const path = State.findPath(L.node, 'dukou') || ['liangdao', 'dukou'];
+        const step = L.stance === 'fast' ? 2 : 1;
         const turns = Math.max(1, Math.ceil((path.length - 1) / step));
-        draft.orders.push({ kind: 'march', legionId: 'transport', label: '石仓运输队', grain: 120 * turns, turns, from: 'liangdao', to: 'dukou', fromName: '粮道·三汊河', toName: '渡口', path, desc: '改道经苇泽，承担额外粮耗' });
-        draft.text = `执行单位：石仓运输队<br>路线：三汊河 → 苇泽北缘 → 渡口<br>时限：${turns}回合（多耗3日粮）<br>终止条件：辎重受袭即折回官道`;
+        draft.orders.push({ kind: 'march', legionId: 'transport', label: '石仓运输队', grain: 120 * turns, turns, from: L.node, to: 'dukou', fromName: nodeName(L.node), toName: '渡口', path, desc: '改道赴渡，承担额外粮耗' });
+        draft.text = `执行单位：石仓运输队（现处${nodeName(L.node)}）<br>路线：${path.map(State.nodeName).join(' → ')}<br>时限：${turns}回合（多耗3日粮）<br>终止条件：辎重受袭即折回官道`;
       } else {
-        const step = S2.legions.beifu.stance === 'fast' ? 2 : 1;
-        const pathB = ['camp', 'bagong', 'dukou'];
+        const B = S2.legions.beifu, T2 = S2.legions.transport;
+        const pathB = State.findPath(B.node, 'dukou') || ['camp', 'dukou'];
+        const pathT = State.findPath(T2.node, 'dukou') || ['liangdao', 'dukou'];
+        const step = B.stance === 'fast' ? 2 : 1;
         const turnsB = Math.max(1, Math.ceil((pathB.length - 1) / step));
-        const pathT = ['liangdao', 'reed', 'dukou'];
         const turnsT = Math.max(1, Math.ceil((pathT.length - 1) / step));
-        draft.orders.push({ kind: 'escort', legionId: 'beifu', label: '北府先锋营', grain: 160 * turnsB, turns: turnsB, from: 'camp', to: 'dukou', fromName: '东岸大营', toName: '渡口', path: pathB, desc: '以一部掩护运输强渡' });
-        draft.orders.push({ kind: 'escort', legionId: 'transport', label: '石仓运输队', grain: 0, turns: turnsT, from: 'liangdao', to: 'dukou', fromName: '粮道·三汊河', toName: '渡口', path: pathT, desc: '随先锋营渡河' });
-        draft.text = `执行单位：北府先锋营（掩护）＋ 石仓运输队<br>路线：大营 → 八公山 → 渡口 强渡<br>时限：${turnsB}回合 · 抵渡后触发关键交锋<br>终止条件：粮车过河，或伤亡三成即退回东岸`;
+        draft.orders.push({ kind: 'escort', legionId: 'beifu', label: '北府先锋营', grain: 160 * turnsB, turns: turnsB, from: B.node, to: 'dukou', fromName: nodeName(B.node), toName: '渡口', path: pathB, desc: '以一部掩护运输强渡' });
+        draft.orders.push({ kind: 'escort', legionId: 'transport', label: '石仓运输队', grain: 0, turns: turnsT, from: T2.node, to: 'dukou', fromName: nodeName(T2.node), toName: '渡口', path: pathT, desc: '随先锋营渡河' });
+        draft.text = `执行单位：北府先锋营（现处${nodeName(B.node)}，掩护）＋ 石仓运输队（现处${nodeName(T2.node)}）<br>路线：${pathB.map(State.nodeName).join(' → ')} ／ ${pathT.map(State.nodeName).join(' → ')}<br>时限：${turnsB}回合 · 抵渡后触发关键交锋<br>终止条件：粮车过河，或伤亡三成即退回东岸`;
       }
       councilDraft = draft;
       $('#cv-draft').innerHTML = `
@@ -1118,7 +1105,7 @@ SHL.UI = (function () {
               <h4>代价</h4>
               <table class="rep-table">
                 <tr><th>项目</th><th>数值</th><th>说明</th></tr>
-                <tr><td>我方伤亡</td><td><b class="num-neg">${result.losses.player}</b> 人</td><td>阵亡与重伤分列，伤员${result.wounded || 0}人需后送</td></tr>
+                <tr><td>我方伤亡</td><td><b class="num-neg">${result.losses.player}</b> 人</td><td>阵亡与重伤分列（含粮车护卫），伤员${result.wounded || 0}人需后送</td></tr>
                 <tr><td>敌方伤亡</td><td><b class="num-pos">${result.losses.enemy}</b> 人</td><td>含溃散，为估计值</td></tr>
                 <tr><td>辎重保存</td><td><b>${Math.round((result.convoyHp || 0) * 100)}%</b></td><td>粮车与随行军资</td></tr>
                 <tr><td>载粮结算</td><td><b>${result.grainLoad || 0}</b> 石</td><td>${result.win ? '交付折赋' : result.partial ? '残车滞西岸待收容' : '残车退回粮道'}，损毁 ${Math.round((result.grainLoad || 0) * (1 - (result.convoyHp || 0)))} 石已自库存扣除</td></tr>

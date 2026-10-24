@@ -72,16 +72,19 @@ SHL.Battle = (function () {
     const inf = Math.max(0, Math.round(input.infantry || 0));
     const cav = Math.max(0, Math.round(input.cavalry || 0));
     const arch = Math.max(0, Math.round(input.archer || 0));
+    const guards = Math.max(0, Math.round(input.guards || 0));   // 运输队护卫（人数，独立于车耐久）
     const p1 = Math.round(inf * 0.35), p2 = Math.round(inf * 0.35);
     const p5 = Math.max(0, inf - p1 - p2);
-    const convoyHp = Math.min(420, Math.max(80, Math.round((input.grainLoad || 0) / 10)));
+    const convoyDur = Math.min(420, Math.max(80, Math.round((input.grainLoad || 0) / 10)));  // 车队耐久（受载量影响，不等于人数）
     const P = { morale: input.morale || 70, fatigue: input.fatigue || 15 };
     const inBy = (id) => cfg.playerUnits.find(u => u.id === id);
-    [p1, p2, p5, arch, cav, convoyHp].forEach((v, i) => {
+    [p1, p2, p5, arch, cav, convoyDur].forEach((v, i) => {
       const tpl = ['p1', 'p2', 'p5', 'p3', 'p4', 'p6'][i];
       const u = { ...inBy(tpl), strength: v, morale: P.morale, fatigue: P.fatigue };
       addU(u, 'player');
     });
+    const simConvoy = units.find(u => u.isConvoy);
+    if (simConvoy) { simConvoy.guardHp = guards; simConvoy.maxGuard = guards; simConvoy.wagonDmg = 0; }
     cfg.enemyUnits.forEach(u => addU(u, 'enemy'));
     const grainLoad = Math.max(0, Math.round(input.grainLoad || 0));
 
@@ -209,7 +212,7 @@ SHL.Battle = (function () {
           } else u.orderState = '已到位';
         }
 
-        // 交战（伤害限幅：实际扣减不超过剩余兵力）
+        // 交战（伤害限幅；粮车伤害先由护卫承担，溢出才伤车体——人员与货物分开核算）
         let gave = 0;
         units.forEach(o => {
           if (o.side === u.side || o.dead || o.routed) return;
@@ -218,8 +221,21 @@ SHL.Battle = (function () {
             const moral = 1 + u.morale / 200;
             const fatigueF = 1 - u.fatigue / 250;
             const charge = u.type === 'cavalry' && u.moving ? 1.5 : 1;
-            const dmg = Math.min(u.dps * moral * fatigueF * charge * dt * 0.5, Math.max(0, o.hp));
-            o.hp -= dmg; o.dmgTaken += dmg; gave += dmg;
+            const dmg = u.dps * moral * fatigueF * charge * dt * 0.5;
+            let applied;
+            if (o.isConvoy) {
+              const toGuard = Math.min(dmg, Math.max(0, o.guardHp));
+              o.guardHp -= toGuard;
+              const toWagon = dmg - toGuard;
+              o.hp -= toWagon;
+              o.dmgTaken += toGuard;
+              o.wagonDmg = (o.wagonDmg || 0) + toWagon;
+              applied = dmg;
+            } else {
+              applied = Math.min(dmg, Math.max(0, o.hp));
+              o.hp -= applied; o.dmgTaken += applied;
+            }
+            gave += applied;
             u.engagedWith = o; o.engagedWith = u;
           }
         });
@@ -291,21 +307,23 @@ SHL.Battle = (function () {
         if (sim.ended) return null;
         sim.ended = true;
         opts = opts || {};
-        const lossDetail = { player: { infantry: 0, cavalry: 0, archer: 0, convoy: 0 }, enemy: { cavalry: 0, infantry: 0, archer: 0 } };
+        const lossDetail = { player: { infantry: 0, cavalry: 0, archer: 0, guard: 0, wagon: 0 }, enemy: { cavalry: 0, infantry: 0, archer: 0 } };
         units.forEach(u => {
-          const l = Math.round(u.dmgTaken);
           if (u.side === 'player') {
-            if (u.isConvoy) lossDetail.player.convoy += l;
-            else if (u.type === 'archer') lossDetail.player.archer += l;
-            else if (u.type === 'cavalry') lossDetail.player.cavalry += l;
-            else lossDetail.player.infantry += l;
+            if (u.isConvoy) {
+              lossDetail.player.guard += Math.round(u.dmgTaken);       // 护卫伤亡（人数）
+              lossDetail.player.wagon += Math.round(u.wagonDmg || 0);  // 车体损耗（耐久，不折算人数）
+            }
+            else if (u.type === 'archer') lossDetail.player.archer += Math.round(u.dmgTaken);
+            else if (u.type === 'cavalry') lossDetail.player.cavalry += Math.round(u.dmgTaken);
+            else lossDetail.player.infantry += Math.round(u.dmgTaken);
           } else {
-            if (u.type === 'cavalry') lossDetail.enemy.cavalry += l;
-            else if (u.type === 'archer') lossDetail.enemy.archer += l;
-            else lossDetail.enemy.infantry += l;
+            if (u.type === 'cavalry') lossDetail.enemy.cavalry += Math.round(u.dmgTaken);
+            else if (u.type === 'archer') lossDetail.enemy.archer += Math.round(u.dmgTaken);
+            else lossDetail.enemy.infantry += Math.round(u.dmgTaken);
           }
         });
-        const playerTotal = lossDetail.player.infantry + lossDetail.player.cavalry + lossDetail.player.archer + lossDetail.player.convoy;
+        const playerTotal = lossDetail.player.infantry + lossDetail.player.cavalry + lossDetail.player.archer + lossDetail.player.guard;
         const enemyTotal = lossDetail.enemy.cavalry + lossDetail.enemy.infantry + lossDetail.enemy.archer;
         const cv = sim.convoy();
         const convoyHp = opts.convoyOverride != null ? opts.convoyOverride : (cv ? Math.max(0, cv.hp / cv.maxHp) : 0);
@@ -347,6 +365,7 @@ SHL.Battle = (function () {
     return {
       participants: parts,
       infantry, cavalry, archer,
+      guards: t ? (t.infantry || 0) : 0,   // 运输队护卫人数（独立于车耐久）
       morale: n ? Math.round(m / n) : 70,
       fatigue: n ? Math.round(f / n) : 15,
       grainLoad: t ? (t.grainLoad || 0) : 0,

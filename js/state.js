@@ -69,7 +69,51 @@ SHL.State = (function () {
     emit('todos');
   }
 
-  /* ───────── 军令队列 ───────── */
+  /* ───────── 军令队列与路径校验（统一入口） ───────── */
+  const roadAdj = (() => {
+    const adj = {};
+    D.theaterHuainan.roads.forEach(([a, b]) => { (adj[a] = adj[a] || []).push(b); (adj[b] = adj[b] || []).push(a); });
+    return adj;
+  })();
+
+  /* 按道路图寻路（BFS）；不可达返回 null */
+  function findPath(from, to) {
+    if (!D.theaterHuainan.nodes[from] || !D.theaterHuainan.nodes[to]) return null;
+    if (from === to) return [from];
+    const prev = {}, q = [from], seen = new Set([from]);
+    while (q.length) {
+      const c = q.shift();
+      if (c === to) break;
+      (roadAdj[c] || []).forEach(nx => { if (!seen.has(nx)) { seen.add(nx); prev[nx] = c; q.push(nx); } });
+    }
+    if (!seen.has(to)) return null;
+    const path = [to];
+    let c = to;
+    while (c !== from) { c = prev[c]; path.unshift(c); }
+    return path;
+  }
+
+  /* 路径合法性：每段必须是道路图中相邻边 */
+  function pathValid(path) {
+    if (!Array.isArray(path) || path.length < 1) return false;
+    for (let i = 0; i < path.length - 1; i++) {
+      if (!(roadAdj[path[i]] || []).includes(path[i + 1])) return false;
+    }
+    return true;
+  }
+
+  /* 军令校验：起点须为当前位置；路径非法则按当前节点重寻；无路可寻则拒绝 */
+  function validateOrder(L, order) {
+    let path = Array.isArray(order.path) ? order.path : null;
+    const startOk = path && path[0] === L.node && pathValid(path);
+    if (!startOk) path = findPath(L.node, order.to);
+    if (!path || !pathValid(path)) return { ok: false, reason: 'no-route' };
+    const step = L.stance === 'fast' ? 2 : 1;
+    const men = Math.max(0, (L.infantry || 0) + (L.cavalry || 0) + (L.archer || 0));
+    const turns = Math.max(1, Math.ceil((path.length - 1) / step));
+    return { ok: true, path, turns, grain: Math.max(1, Math.round(men / 40)) * turns };
+  }
+
   function addOrder(o) {
     o.id = 'ord' + Date.now() + Math.random().toString(36).slice(2, 5);
     S.queue.push(o);
@@ -122,7 +166,7 @@ SHL.State = (function () {
     let orderGrain = 0;
     S.phase = '结算';
 
-    /* 1. 侦察类军令 → 情报核实（费用一并计入军令粮耗） */
+    /* 1. 侦察类军令 → 情报核实（路径与费用在第3节统一校验计算） */
     S.queue.forEach(q => {
       if (q.kind === 'scout') {
         S.flags.scoutedDukou = true;
@@ -132,7 +176,6 @@ SHL.State = (function () {
           text: '西岸为秦军前锋营，约三千骑步，无浮桥，正伐木为筏',
           day: '本回合核实',
         };
-        orderGrain += (q.grain || 0);
         lines.push({ t: '侦', text: `${q.label || '斥候乙队'} 亥时抵渡口西岸，核实完毕。`, cls: 'ev' });
       }
     });
@@ -152,16 +195,22 @@ SHL.State = (function () {
         : '已 ' + S.turn + ' 回合无回报（情报过时）';
     }
 
-    /* 3. 消耗新军令 → 转为行军状态 */
+    /* 3. 消耗新军令 → 校验路径合法性后转为行军状态 */
     S.queue.forEach(q => {
       if (q.kind === 'march' || q.kind === 'escort') {
         const L = S.legions[q.legionId];
         if (!L) return;
+        const v = validateOrder(L, q);
+        if (!v.ok) {
+          lines.push({ t: '拒', text: `${L.name} 的军令与当前位置不符，且无路可至${nodeName(q.to)}——已退回。`, cls: 'ev' });
+          return;
+        }
+        q.path = v.path; q.turns = v.turns; q.grain = v.grain;
         const step = L.stance === 'fast' ? 2 : 1;
-        L.march = { path: q.path || [q.from, q.to], progress: 0, step, kind: q.kind };
-        L.supplyDays = Math.max(0, L.supplyDays - (q.turns || 1) * 2);
-        orderGrain += (q.grain || 0);
-        lines.push({ t: '行', text: `${L.name} 自 ${q.fromName || '现地'} 出发（${stanceName(L.stance)}），预计 ${q.turns} 回合抵 ${q.toName || q.to}。`, cls: 'good' });
+        L.march = { path: q.path, progress: 0, step, kind: q.kind };
+        L.supplyDays = Math.max(0, L.supplyDays - q.turns * 2);
+        orderGrain += q.grain;
+        lines.push({ t: '行', text: `${L.name} 自 ${nodeName(q.path[0])} 出发（${stanceName(L.stance)}），预计 ${q.turns} 回合抵 ${q.toName || q.to}。`, cls: 'good' });
         if (q.kind === 'escort' && !S.flags.escortStarted) {
           S.flags.escortStarted = true;
           lines.push({ t: '护', text: '运输队随行，粮车两百乘出三汊河。', cls: '' });
@@ -169,6 +218,15 @@ SHL.State = (function () {
       } else if (q.kind === 'stance') {
         const L = S.legions[q.legionId];
         if (L) { L.stance = q.stance; lines.push({ t: '令', text: `${L.name} 行军态势改为「${stanceName(q.stance)}」。`, cls: '' }); }
+      } else if (q.kind === 'scout') {
+        // 侦察也须可达：以当前节点重寻路
+        const L = S.legions[q.legionId];
+        if (L) {
+          const v = validateOrder(L, q);
+          if (!v.ok) { lines.push({ t: '拒', text: `${L.name} 的侦察令无可行路线——已退回。`, cls: 'ev' }); return; }
+          q.path = v.path; q.turns = v.turns; q.grain = Math.max(1, Math.round(((L.infantry || 0) + (L.cavalry || 0) + (L.archer || 0)) / 40));
+          orderGrain += q.grain;
+        }
       }
     });
     S.queue = [];
@@ -255,16 +313,21 @@ SHL.State = (function () {
     const transport = S.legions.transport;
     const parts = (result.participants || []).filter(id => S.legions[id] && id !== 'transport');
 
-    /* 步骑弩损失按各参战军团该兵种占比分摊 */
+    /* 步骑弩损失按各参战军团该兵种占比分摊（向下取整+余数分配，保证总人数守恒） */
     function distribute(type, lossTotal) {
       if (!lossTotal || !parts.length) return;
-      const sum = parts.reduce((s, id) => s + Math.max(0, S.legions[id][type]), 0);
+      const avail = parts.map(id => ({ id, v: Math.max(0, S.legions[id][type]) }));
+      const sum = avail.reduce((s, c) => s + c.v, 0);
       if (!sum) return;
-      parts.forEach(id => {
-        const L = S.legions[id];
-        const share = Math.min(L[type], Math.round(lossTotal * L[type] / sum));
-        L[type] -= share;
+      const remaining = Math.min(lossTotal, sum);   // 总损失不超过现存参战人数
+      const alloc = avail.map(c => {
+        const exact = remaining * c.v / sum;
+        return { id: c.id, n: Math.floor(exact), frac: exact - Math.floor(exact) };
       });
+      let left = remaining - alloc.reduce((s, a) => s + a.n, 0);
+      alloc.sort((x, y) => y.frac - x.frac);
+      for (let i = 0; left > 0 && i < alloc.length; i++, left--) alloc[i].n++;
+      alloc.forEach(a => { S.legions[a.id][type] -= a.n; });
     }
     distribute('infantry', ld.player.infantry || 0);
     distribute('cavalry', ld.player.cavalry || 0);
@@ -277,7 +340,8 @@ SHL.State = (function () {
     });
 
     if (transport) {
-      transport.infantry = Math.max(0, transport.infantry - (ld.player.convoy || 0));
+      // 护卫伤亡按人数扣；车损已折算进辎重（不换算成人数）
+      transport.infantry = Math.max(0, transport.infantry - (ld.player.guard || 0));
       const load = result.grainLoad || transport.grainLoad || 0;
       const lost = Math.round(load * (1 - clamp(result.convoyHp || 0, 0, 1)));
       const saved = Math.round(load * clamp(result.convoyHp || 0, 0, 1));
@@ -363,6 +427,7 @@ SHL.State = (function () {
     addOrder, removeOrder, ordersOfLegion, blockingIssues, softWarnings,
     endTurn, takeSettle, settlePending, stanceName, nodeName,
     writeBattleResult, markReportViewed, addTodo, resolveTodo,
+    findPath, pathValid, validateOrder,
     history, SEASONS, BASE_UPKEEP, on, emit,
   };
 })();

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>十六国 · 山河未定 — 规则回归测试</title>
+<style>
+  body { font-family: Consolas, "Microsoft YaHei", monospace; background: #F2ECDD; color: #232826; padding: 20px; }
+  h1 { font-size: 18px; }
+  .pass { color: #4E7A3F; }
+  .fail { color: #984C3F; font-weight: bold; }
+  .case { margin: 4px 0; }
+  #summary { margin-top: 14px; font-size: 16px; border-top: 1px solid #999; padding-top: 10px; }
+</style>
+</head>
+<body>
+<h1>规则回归测试（路径合法性 / 人员守恒 / 固定步进 / 阶段恢复 / 护卫分离）</h1>
+<div id="out"></div>
+<div id="summary">运行中…</div>
+<script src="../js/data.js"></script>
+<script src="../js/state.js"></script>
+<script src="../js/battle.js"></script>
+<script src="regression.js"></script>
+</body>
+</html>
