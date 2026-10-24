@@ -18,6 +18,7 @@ SHL.Battle = (function () {
 
   const WORLD = { w: 120, h: 100 };
   const NX = 0.34, NW = 0.045, CY = 0.52, CW = 0.06;  // 淝水与浅滩（归一化）
+  const SIM_DT = 1 / 30;   // 固定模拟步长：亲自指挥与委任共用，结果与帧率/倍速无关
 
   /* ═══════════════ 模拟核心（无渲染依赖） ═══════════════ */
   function nx2wx(nx) { return (nx - 0.5) * WORLD.w; }
@@ -37,6 +38,7 @@ SHL.Battle = (function () {
   function createSim(cfg, input) {
     const hill = cfg.terrain.hill;
     const RIVERWX = nx2wx(NX), CROSSZ = nz2wz(CY);
+    const WESTX = (NX - NW - 0.5) * WORLD.w;   // 西岸线：越过此处才算渡过河西
     const EXITX = (cfg.exitZone.x1 - 0.5) * WORLD.w + 4;
     const EXITZ = ((cfg.exitZone.y1 + cfg.exitZone.y2) / 2 - 0.5) * WORLD.h;
     const WINX = (cfg.exitZone.x1 - 0.5) * WORLD.w + 5;
@@ -85,6 +87,7 @@ SHL.Battle = (function () {
 
     const sim = {
       units, grainLoad, time: 0, stage: 0, ended: false, events: [],
+      participants: input.participants || [],   // 参战军团ID：回写按此名单
       _alertT: 0, _p3EastT: 0, _p3AllT: 0.0001,
       convoy() { return units.find(u => u.isConvoy); },
       live(id) { const u = units.find(x => x.id === id); return u && !u.dead ? u : null; },
@@ -189,14 +192,14 @@ SHL.Battle = (function () {
             const st = sp * dt;
             let npx = u.x + dx / d * st, npz = u.z + dz / d * st;
             if (!u.isConvoy) {
-              // 车马沉重：粮车不受推挤，其余队伍限幅避让
+              // 车马沉重：粮车不受推挤；推力按时间计（单位/秒），与步长无关
               units.forEach(o => {
                 if (o === u || o.dead) return;
                 const dd = Math.hypot(npx - o.x, npz - o.z);
                 if (dd < 4.5 && dd > 0.01) {
-                  const push = Math.min(4.5 - dd, 1.2) * 0.5;
-                  npx += (npx - o.x) / dd * push;
-                  npz += (npz - o.z) / dd * push;
+                  const pushRate = Math.min(4.5 - dd, 1.2);   // ≤1.2 单位/秒
+                  npx += (npx - o.x) / dd * pushRate * dt;
+                  npz += (npz - o.z) / dd * pushRate * dt;
                 }
               });
             }
@@ -206,7 +209,7 @@ SHL.Battle = (function () {
           } else u.orderState = '已到位';
         }
 
-        // 交战
+        // 交战（伤害限幅：实际扣减不超过剩余兵力）
         let gave = 0;
         units.forEach(o => {
           if (o.side === u.side || o.dead || o.routed) return;
@@ -215,7 +218,7 @@ SHL.Battle = (function () {
             const moral = 1 + u.morale / 200;
             const fatigueF = 1 - u.fatigue / 250;
             const charge = u.type === 'cavalry' && u.moving ? 1.5 : 1;
-            const dmg = u.dps * moral * fatigueF * charge * dt * 0.5;
+            const dmg = Math.min(u.dps * moral * fatigueF * charge * dt * 0.5, Math.max(0, o.hp));
             o.hp -= dmg; o.dmgTaken += dmg; gave += dmg;
             u.engagedWith = o; o.engagedWith = u;
           }
@@ -266,24 +269,28 @@ SHL.Battle = (function () {
 
       checkEnd() {
         const cv = sim.convoy();
-        const crossed = cv ? cv.x < RIVERWX + 2 : false;   // 已越过河心为「确已渡河」
-        if (cv && !cv.dead && cv.hp > 0 && cv.x < WINX)
+        // 三段判定：抵达撤离区（完整成功）→ 越过西岸线（部分）→ 仍在东岸/河道（未渡）
+        const atExit = cv ? cv.x < WINX : false;
+        const crossedWest = cv ? cv.x < WESTX : false;
+        if (cv && !cv.dead && cv.hp > 0 && atExit)
           return sim._finish(true, '运输队安然渡过淝水，粮道复通。');
         const players = units.filter(u => u.side === 'player');
         const combat = players.filter(u => !u.isConvoy);
         if (!cv || cv.dead) return sim._finish(false, '运输队毁于渡口，粮道中断。');
         if (combat.length && combat.every(u => u.dead || u.routed || u.safe)) {
-          if (crossed) return sim._finish(true, '掩护部队虽尽，粮车竟得全而退——虽胜犹惋。');
-          return sim._finish(false, '掩护尽没，粮车滞留东岸，终为敌所获。');
+          if (atExit) return sim._finish(true, '掩护部队虽尽，粮车竟得全而退——虽胜犹惋。');
+          if (crossedWest) return sim._finish(false, '掩护尽没，粮车虽已过西岸，然未抵撤离区——任务未竟，残车待收容。', { partial: true });
+          return sim._finish(false, '掩护尽没，粮车滞留东岸，终为敌所获。', { convoyOverride: 0 });
         }
         if (sim.time > cfg.timeLimit)
-          return sim._finish(cv && !cv.dead && cv.hp > 0 && crossed, crossed ? '时限已至，按预案由都督自动结算（委任结果）。' : '时限已至，粮车未及渡河，都督收兵再图。');
+          return sim._finish(false, '时限已至，粮车未及抵达撤离区，都督收兵再图。', { partial: crossedWest });
         return null;
       },
 
-      _finish(win, text) {
+      _finish(win, text, opts) {
         if (sim.ended) return null;
         sim.ended = true;
+        opts = opts || {};
         const lossDetail = { player: { infantry: 0, cavalry: 0, archer: 0, convoy: 0 }, enemy: { cavalry: 0, infantry: 0, archer: 0 } };
         units.forEach(u => {
           const l = Math.round(u.dmgTaken);
@@ -301,11 +308,13 @@ SHL.Battle = (function () {
         const playerTotal = lossDetail.player.infantry + lossDetail.player.cavalry + lossDetail.player.archer + lossDetail.player.convoy;
         const enemyTotal = lossDetail.enemy.cavalry + lossDetail.enemy.infantry + lossDetail.enemy.archer;
         const cv = sim.convoy();
-        const convoyHp = cv ? Math.max(0, cv.hp / cv.maxHp) : 0;
+        const convoyHp = opts.convoyOverride != null ? opts.convoyOverride : (cv ? Math.max(0, cv.hp / cv.maxHp) : 0);
         const enemyInit = cfg.enemyUnits.reduce((s, u) => s + u.strength, 0);
         const enemyAlive = units.filter(u => u.side === 'enemy' && !u.dead).reduce((s, u) => s + u.hp, 0);
         const result = {
           win, text,
+          partial: !!opts.partial,
+          participants: sim.participants,
           losses: { player: playerTotal, enemy: enemyTotal },
           lossDetail,
           wounded: Math.round(playerTotal * 0.25),
@@ -324,25 +333,32 @@ SHL.Battle = (function () {
     return sim;
   }
 
-  /* ═══════════════ 战略输入推导 ═══════════════ */
+  /* ═══════════════ 战略输入推导（按接敌时的参战名单） ═══════════════ */
   function deriveInput(S) {
-    const b = S.legions.beifu, t = S.legions.transport;
+    const t = S.legions.transport;
+    // 只有此刻已抵达渡口的战斗军团才参战；运输队为触发者，仅提供载粮与护卫
+    const parts = ['beifu', 'bagongshan', 'scouts'].filter(id => S.legions[id] && S.legions[id].node === 'dukou');
+    let infantry = 0, cavalry = 0, archer = 0, m = 0, f = 0, n = 0;
+    parts.forEach(id => {
+      const L = S.legions[id];
+      infantry += L.infantry; cavalry += L.cavalry; archer += L.archer;
+      m += L.morale; f += L.fatigue; n++;
+    });
     return {
-      morale: b ? b.morale : 70,
-      fatigue: b ? b.fatigue : 15,
-      infantry: b ? b.infantry : 0,
-      cavalry: b ? b.cavalry : 0,
-      archer: b ? b.archer : 0,
+      participants: parts,
+      infantry, cavalry, archer,
+      morale: n ? Math.round(m / n) : 70,
+      fatigue: n ? Math.round(f / n) : 15,
       grainLoad: t ? (t.grainLoad || 0) : 0,
     };
   }
   function assessPlayerForce(S) {
     const i = deriveInput(S);
     const total = i.infantry + i.cavalry + i.archer;
-    return { total, canLiveCommand: total >= 120, grainLoad: i.grainLoad };
+    return { total, canLiveCommand: total >= 120, grainLoad: i.grainLoad, participants: i.participants };
   }
 
-  /* ═══════════════ 委任：headless 复跑同一模拟器 ═══════════════ */
+  /* ═══════════════ 委任：headless 复跑同一模拟器（同一固定步长） ═══════════════ */
   function simulateDelegated(input) {
     const cfg = D.battleDukou;
     const sim = createSim(cfg, input);
@@ -351,10 +367,11 @@ SHL.Battle = (function () {
     sim.deployReserve();
     let result = null;
     let guard = 0;
-    while (!result && guard++ < 4000) {
-      result = sim.step(0.5);
+    const maxSteps = Math.ceil((cfg.timeLimit + 60) / SIM_DT);
+    while (!result && guard++ < maxSteps) {
+      result = sim.step(SIM_DT);
     }
-    if (!result) result = sim._finish(sim.convoy() && sim.convoy().hp > 0, '时限已至，按预案由都督自动结算（委任结果）。');
+    if (!result) result = sim._finish(false, '时限已至，粮车未及抵达撤离区，都督收兵再图。', { partial: sim.convoy() ? sim.convoy().x < (NX - NW - 0.5) * WORLD.w : false });
     result.delegated = true;
     return result;
   }
@@ -721,26 +738,33 @@ SHL.Battle = (function () {
   });
   function fmt(s) { return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(Math.floor(s % 60)).padStart(2, '0'); }
 
-  /* ── 主循环 ── */
+  /* ── 主循环：固定步长累积器驱动，渲染单独更新 ── */
+  let acc = 0;
   function loop() {
     if (!alive) return;
     raf = requestAnimationFrame(loop);
     const now = performance.now();
     const rawDt = Math.min(0.05, (now - _clock) / 1000);
     _clock = now;
-    const dt = paused ? 0 : rawDt * speed;
-    if (!ended && dt > 0) {
-      const result = sim.step(dt);
-      refreshUnitBar();
-      updateGoal();
-      document.getElementById('bt-timer').textContent = fmt(sim.time);
-      // 军情：从模拟事件中取用（每帧最多两条）
-      while (sim.events.length) {
-        const ev = sim.events.shift();
-        setAlert(ev.text, ev.kind);
-        if (ev.kind === 'threat') SHL.Audio.alert();
+    if (!ended) {
+      acc += paused ? 0 : rawDt * speed;
+      let steps = 0;
+      while (acc >= SIM_DT && steps < 8 && !ended) {
+        acc -= SIM_DT; steps++;
+        const result = sim.step(SIM_DT);
+        while (sim.events.length) {
+          const ev = sim.events.shift();
+          setAlert(ev.text, ev.kind);
+          if (ev.kind === 'threat') SHL.Audio.alert();
+        }
+        if (result) { showResult(result); break; }
       }
-      if (result) { showResult(result); }
+      if (acc > SIM_DT * 8) acc = 0;   // 积压过多时丢弃，避免螺旋追赶
+      if (steps) {
+        refreshUnitBar();
+        updateGoal();
+        document.getElementById('bt-timer').textContent = fmt(sim.time);
+      }
     }
     syncView();
     renderer.render(scene, camera);

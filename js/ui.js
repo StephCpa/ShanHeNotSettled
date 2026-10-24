@@ -578,8 +578,21 @@ SHL.UI = (function () {
   /* ═══════════════ 推进回合 ═══════════════ */
   function updateEndTurn() {
     const S = State.current();
-    const issues = State.blockingIssues();
     const btn = $('#end-turn');
+    const main = btn.querySelector('.et-main');
+    btn.classList.remove('blocked');
+    if (S.phase === '待交锋') {
+      main.textContent = '处理渡口交锋';
+      $('#et-sub').textContent = '亲自指挥或委任将领';
+      return;
+    }
+    if (S.phase === '待阅战报') {
+      main.textContent = '查看战报';
+      $('#et-sub').textContent = '阅后继续筹划';
+      return;
+    }
+    main.textContent = '推进回合';
+    const issues = State.blockingIssues();
     btn.classList.toggle('blocked', issues.length > 0);
     $('#et-sub').textContent = issues.length ? '有阻塞问题待处理' : (S.queue.length ? `待执行军令 ${S.queue.length} 条` : '先检查待处理军令');
   }
@@ -587,6 +600,7 @@ SHL.UI = (function () {
     const btn = $('#end-turn');
     btn.addEventListener('mouseenter', () => {
       const S = State.current();
+      if (S.phase !== '筹划') return;
       const issues = State.blockingIssues();
       const warns = State.softWarnings();
       const pv = $('#et-preview');
@@ -601,10 +615,13 @@ SHL.UI = (function () {
     btn.addEventListener('mouseleave', () => $('#et-preview').classList.add('hidden'));
     btn.addEventListener('click', () => {
       const S = State.current();
+      // 阶段入口：待交锋 / 待阅战报时，此按钮是恢复入口
+      if (S.phase === '待交锋') { promptBattle(); return; }
+      if (S.phase === '待阅战报') { if (S.lastBattleResult) openReport(S.lastBattleResult); return; }
       const issues = State.blockingIssues();
       if (issues.length) { toast(issues[0], ''); SHL.Audio.alert(); return; }
       const r = State.endTurn();
-      if (!r.ok) { toast(r.reason || '无法推进', ''); return; }
+      if (!r.ok) { toast(r.reason || '无法推进', ''); SHL.Audio.alert(); updateEndTurn(); return; }
       showSettle(r);
     });
   }
@@ -647,27 +664,40 @@ SHL.UI = (function () {
   function promptBattle() {
     if (State.current().phase !== '待交锋') return;   // 已处理过则不再弹
     SHL.Audio.alert();
-    const assess = SHL.Battle.assessPlayerForce(State.current());
+    const S = State.current();
+    const assess = SHL.Battle.assessPlayerForce(S);
+    const partNames = assess.participants.length
+      ? assess.participants.map(id => `${S.legions[id].name}（${troopStr(S.legions[id])}）`).join(' · ')
+      : '仅运输队（无战斗掩护）';
     const mask = document.createElement('div');
     mask.className = 'ov-mask';
     mask.innerHTML = `
-      <div class="ov-card" style="width:520px; padding:26px 30px">
+      <div class="ov-card" style="width:560px; padding:26px 30px">
         <h3 style="font-family:var(--f-title);font-size:24px;letter-spacing:4px;margin-bottom:10px">渡口 · 关键交锋</h3>
         <p style="font-size:14px;line-height:2">秦军前锋扑向渡口粮道。是否<b style="color:var(--zhusha)">亲自指挥</b>？</p>
         <p class="dim" style="font-size:13px;line-height:1.9">亲自指挥：以${esc(D.battleDukou.commanderName)}视角调度六个单位（2—5分钟）。<br>
         委任：交由现场将领按预案处理，<b>仍按同一战斗模型结算</b>，只改命令来源。</p>
-        <p class="dim" style="font-size:12.5px;line-height:1.8">当前继承：北府作战兵力 ${assess.total.toLocaleString()} 人 · 载粮 ${assess.grainLoad.toLocaleString()} 石 —— 战略准备直接决定战场输入。</p>
+        <p style="font-size:13px;line-height:1.9">参战部队：<b>${esc(partNames)}</b><br>
+        <span class="dim">只有已抵达渡口的军团参战；在途部队不自动入场。载粮 ${assess.grainLoad.toLocaleString()} 石。</span></p>
         <div style="display:flex;gap:12px;margin-top:18px">
           ${assess.canLiveCommand
             ? '<button class="btn primary" id="pb-live" style="flex:1;justify-content:center">亲自指挥</button>'
             : '<button class="btn disabled" disabled style="flex:1;justify-content:center">亲自指挥<span class="reason">可用兵力不足</span></button>'}
           <button class="btn" id="pb-deleg" style="flex:1;justify-content:center">委任将领</button>
         </div>
+        <div style="margin-top:10px; text-align:right">
+          <button class="btn ghost" id="pb-later" style="font-size:12px">暂缓议事（回合将暂停于此）</button>
+        </div>
       </div>`;
     document.body.appendChild(mask);
     mask.querySelector('#pb-deleg').addEventListener('click', () => {
       mask.remove();
       startBattle(true);
+    });
+    mask.querySelector('#pb-later').addEventListener('click', () => {
+      mask.remove();
+      toast('交锋待处理 —— 可随时点右下「处理渡口交锋」', 'info');
+      updateEndTurn();
     });
     const liveBtn = mask.querySelector('#pb-live');
     if (liveBtn) liveBtn.addEventListener('click', () => { mask.remove(); startBattle(false); });
@@ -986,6 +1016,9 @@ SHL.UI = (function () {
 
     mask.querySelectorAll('.proposal').forEach(el => el.addEventListener('click', () => {
       councilProposal = el.dataset.pid;
+      // 切换方案使旧草案失效
+      councilDraft = null;
+      $('#cv-draft').innerHTML = '';
       mask.querySelectorAll('.proposal').forEach(x => x.classList.toggle('selected', x === el));
       $('#cv-confirm').disabled = false;
       $('#cv-cancel-p').disabled = false;
@@ -999,8 +1032,12 @@ SHL.UI = (function () {
     }));
     $('#cv-cancel-p').addEventListener('click', () => {
       councilProposal = null;
+      councilDraft = null;
+      State.current().councilChosen = null;
       mask.querySelectorAll('.proposal').forEach(x => x.classList.remove('selected'));
       $('#cv-confirm').disabled = true;
+      $('#cv-cancel-p').disabled = true;
+      $('#cv-draft').innerHTML = '';
       SHL.Map3D.clearMarchArrows();
     });
     $('#cv-locate').addEventListener('click', () => { mask.remove(); pickNode('dukou'); });
@@ -1084,7 +1121,7 @@ SHL.UI = (function () {
                 <tr><td>我方伤亡</td><td><b class="num-neg">${result.losses.player}</b> 人</td><td>阵亡与重伤分列，伤员${result.wounded || 0}人需后送</td></tr>
                 <tr><td>敌方伤亡</td><td><b class="num-pos">${result.losses.enemy}</b> 人</td><td>含溃散，为估计值</td></tr>
                 <tr><td>辎重保存</td><td><b>${Math.round((result.convoyHp || 0) * 100)}%</b></td><td>粮车与随行军资</td></tr>
-                <tr><td>载粮结算</td><td><b>${result.grainLoad || 0}</b> 石</td><td>${result.win ? '交付折赋' : '残车退回粮道'}，损毁 ${Math.round((result.grainLoad || 0) * (1 - (result.convoyHp || 0)))} 石已自库存扣除</td></tr>
+                <tr><td>载粮结算</td><td><b>${result.grainLoad || 0}</b> 石</td><td>${result.win ? '交付折赋' : result.partial ? '残车滞西岸待收容' : '残车退回粮道'}，损毁 ${Math.round((result.grainLoad || 0) * (1 - (result.convoyHp || 0)))} 石已自库存扣除</td></tr>
                 <tr><td>粮秣</td><td>已扣本回合消耗</td><td>资源账目由规则产生</td></tr>
               </table>
             </div>

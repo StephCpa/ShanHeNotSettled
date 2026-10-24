@@ -111,13 +111,18 @@ SHL.State = (function () {
   /* ───────── 推进回合 ───────── */
   function endTurn() {
     if (settleRunner) return { ok: false, reason: '结算进行中' };
+    // 阶段合法性：只有筹划阶段可以推进
+    if (S.phase === '待交锋') return { ok: false, reason: '渡口交锋待处理 —— 须先决定亲自指挥或委任' };
+    if (S.phase === '待阅战报') return { ok: false, reason: '渡口战报待阅 —— 阅后继续' };
+    if (S.phase !== '筹划') return { ok: false, reason: '当前阶段无法推进回合' };
     const issues = blockingIssues();
     if (issues.length) return { ok: false, issues };
 
     const lines = [];
+    let orderGrain = 0;
     S.phase = '结算';
 
-    /* 1. 侦察类军令 → 情报核实 */
+    /* 1. 侦察类军令 → 情报核实（费用一并计入军令粮耗） */
     S.queue.forEach(q => {
       if (q.kind === 'scout') {
         S.flags.scoutedDukou = true;
@@ -127,24 +132,27 @@ SHL.State = (function () {
           text: '西岸为秦军前锋营，约三千骑步，无浮桥，正伐木为筏',
           day: '本回合核实',
         };
+        orderGrain += (q.grain || 0);
         lines.push({ t: '侦', text: `${q.label || '斥候乙队'} 亥时抵渡口西岸，核实完毕。`, cls: 'ev' });
       }
     });
 
-    /* 2. 情报老化（核实一回合后转过时） */
+    /* 2. 情报老化：核实一回合后转过时；年龄每回合按核实回合重算 */
     const I = S.intel.dukou;
     if (I.state === 'confirmed' && S.turn - (S.intel.verifiedTurn || 0) >= 1) {
       I.state = 'stale';
-      I.day = (S.turn - S.intel.verifiedTurn) + '回合前（情报过时）';
       lines.push({ t: '报', text: '渡口情报已过时，西岸动向未知。', cls: '' });
-    } else if (I.state === 'unverified') {
+    } else if (I.state === 'unverified' && S.turn > 1) {
       I.state = 'stale';
-      I.day = (S.turn) + '回合仍无回报（情报过时）';
       lines.push({ t: '报', text: '渡口情报过时，仍未核实。西岸炊烟较昨更密。', cls: '' });
+    }
+    if (I.state === 'stale') {
+      I.day = S.intel.verifiedTurn
+        ? (S.turn - S.intel.verifiedTurn) + '回合前核实（情报过时）'
+        : '已 ' + S.turn + ' 回合无回报（情报过时）';
     }
 
     /* 3. 消耗新军令 → 转为行军状态 */
-    let orderGrain = 0;
     S.queue.forEach(q => {
       if (q.kind === 'march' || q.kind === 'escort') {
         const L = S.legions[q.legionId];
@@ -235,25 +243,39 @@ SHL.State = (function () {
   function stanceName(s) { return s === 'fast' ? '急行' : s === 'avoid' ? '避敌' : '稳行'; }
   function nodeName(id) { const n = D.theaterHuainan.nodes[id]; return n ? n.name : id; }
 
-  /* ───────── 交锋回写（一次性，按类型扣减） ───────── */
+  /* ───────── 交锋回写（一次性；只回写参战军团，未到场者不动） ───────── */
   function writeBattleResult(result) {
     if (S.battleDukouDone) return false;
     S.battleDukouDone = {
       win: result.win, text: result.text, time: result.time,
       losses: result.losses, convoyHp: result.convoyHp,
+      participants: result.participants || [],
     };
     const ld = result.lossDetail || { player: {}, enemy: {} };
-    const beifu = S.legions.beifu;
     const transport = S.legions.transport;
-    if (beifu) {
-      beifu.infantry = Math.max(0, beifu.infantry - (ld.player.infantry || 0));
-      beifu.cavalry = Math.max(0, beifu.cavalry - (ld.player.cavalry || 0));
-      beifu.archer = Math.max(0, beifu.archer - (ld.player.archer || 0));
-      beifu.morale = clamp(beifu.morale + (result.win ? 6 : -10), 20, 100);
-      beifu.fatigue = clamp(beifu.fatigue + 22, 0, 100);
-      beifu.node = 'dukou';
-      beifu.march = null;
+    const parts = (result.participants || []).filter(id => S.legions[id] && id !== 'transport');
+
+    /* 步骑弩损失按各参战军团该兵种占比分摊 */
+    function distribute(type, lossTotal) {
+      if (!lossTotal || !parts.length) return;
+      const sum = parts.reduce((s, id) => s + Math.max(0, S.legions[id][type]), 0);
+      if (!sum) return;
+      parts.forEach(id => {
+        const L = S.legions[id];
+        const share = Math.min(L[type], Math.round(lossTotal * L[type] / sum));
+        L[type] -= share;
+      });
     }
+    distribute('infantry', ld.player.infantry || 0);
+    distribute('cavalry', ld.player.cavalry || 0);
+    distribute('archer', ld.player.archer || 0);
+    parts.forEach(id => {
+      const L = S.legions[id];
+      L.morale = clamp(L.morale + (result.win ? 6 : -10), 20, 100);
+      L.fatigue = clamp(L.fatigue + 22, 0, 100);
+      L.march = null;   // 参战者已抵渡口，在途状态清除（位置不瞬移——本就到场）
+    });
+
     if (transport) {
       transport.infantry = Math.max(0, transport.infantry - (ld.player.convoy || 0));
       const load = result.grainLoad || transport.grainLoad || 0;
@@ -264,6 +286,11 @@ SHL.State = (function () {
         S.res.grain = Math.max(0, S.res.grain - lost);
         S.res.gold += Math.round(saved * 0.05);
         transport.grainLoad = 0;
+        transport.node = 'dukou';
+      } else if (result.partial) {
+        // 掩护尽没但粮车已过西岸：任务未竟，残车滞西岸待收容
+        S.res.grain = Math.max(0, S.res.grain - lost);
+        transport.grainLoad = saved;
         transport.node = 'dukou';
       } else {
         // 护送失败：残车退回粮道，所存即未损部分
