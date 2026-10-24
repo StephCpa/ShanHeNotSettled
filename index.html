@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>十六国 · 山河未定 — 3D界面原型</title>
+<link rel="stylesheet" href="css/main.css">
+</head>
+<body data-uiscale="100">
+
+<!-- ══════════ 时代与剧本选择 ══════════ -->
+<section id="screen-chapter" class="screen active">
+  <div class="ink-bg" aria-hidden="true">
+    <svg class="ink-mountains" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMax slice">
+      <g class="m-far">
+        <path d="M0,760 L140,640 260,720 400,600 560,730 700,650 860,760 1040,620 1200,720 1380,610 1560,700 1740,640 1920,720 1920,1080 0,1080 Z"/>
+      </g>
+      <g class="m-mid">
+        <path d="M0,860 L120,780 240,830 380,720 520,820 680,750 820,850 980,740 1140,840 1320,760 1500,850 1680,780 1920,860 1920,1080 0,1080 Z"/>
+      </g>
+      <g class="m-near">
+        <path d="M0,980 L180,900 320,940 480,860 640,950 800,880 980,960 1180,870 1360,950 1560,890 1760,960 1920,900 1920,1080 0,1080 Z"/>
+      </g>
+    </svg>
+    <div class="mist"></div>
+  </div>
+
+  <header class="ch-head">
+    <div class="brand">
+      <span class="seal">十六国</span>
+      <span class="brand-sub">山河未定 · 界面原型 1.0</span>
+    </div>
+    <div class="ch-head-right">
+      <button class="btn btn-ghost" id="btn-settings">设置</button>
+      <button class="btn btn-ghost" id="btn-about">史料依据</button>
+    </div>
+  </header>
+
+  <div class="ch-title">
+    <h1>选择时代与剧本</h1>
+    <p class="ch-title-sub">第一步 选时代 · 第二步 选视角 · 第三步 选模式 —— 同一条时间轴上的多条政权轨道，并行存在，非依次替代</p>
+  </div>
+
+  <div class="ch-body">
+    <!-- 多轨时间轴 -->
+    <div class="timeline-wrap">
+      <div class="timeline-ruler" id="tl-ruler"></div>
+      <div class="timeline-tracks" id="tl-tracks"></div>
+      <div class="tl-ext-mark" title="439年以后为南北朝扩展">|← 439 · 南北朝扩展 →</div>
+    </div>
+
+    <div class="ch-detail" id="ch-detail">
+      <div class="ch-detail-empty">
+        <p>点击上方政权轨道上的篇章，查看剧本详情</p>
+        <p class="dim">时代框架覆盖 304—439 年的十六国；淝水切片可直接游玩</p>
+      </div>
+    </div>
+  </div>
+
+  <footer class="ch-foot">
+    <p class="dim">解锁奖励以史料与外观为主 · 章节可独立进入 · 延续旧存档将保留已改变的历史</p>
+  </footer>
+</section>
+
+<!-- ══════════ 战略主界面 ══════════ -->
+<section id="screen-strategy" class="screen">
+  <div id="map-wrap">
+    <canvas id="gl"></canvas>
+    <div id="map-labels"></div>
+    <div id="map-vignette"></div>
+
+    <div id="breadcrumb">
+      <span class="crumb" data-level="world">天下</span><i>／</i><span class="crumb" data-level="theater">淮南</span><i>／</i><span class="crumb" data-level="site">寿阳</span>
+      <span class="bc-hint" id="bc-hint">滚轮缩放 · 中键拖拽 · Q/E 旋转 · Home 复位北向</span>
+    </div>
+
+    <div id="map-hud-right">
+      <div class="hud-layer-btns">
+        <button class="hud-btn active" id="hud-terrain" title="地形属性层">地</button>
+        <button class="hud-btn" id="hud-supply" title="粮道与补给层">粮</button>
+        <button class="hud-btn" id="hud-intel" title="情报状态层">侦</button>
+        <button class="hud-btn" id="hud-weather" title="季节与天气层">候</button>
+      </div>
+      <div class="hud-legend" id="hud-legend"></div>
+    </div>
+
+    <div id="minimap">
+      <div class="mm-title">小地图 · 天下</div>
+      <canvas id="mm-canvas" width="200" height="128"></canvas>
+      <div class="mm-rect" id="mm-rect"></div>
+    </div>
+
+    <div id="settle-overlay" class="hidden">
+      <div class="settle-card">
+        <h3>回合结算 <span class="dim" id="settle-turn"></span></h3>
+        <div class="settle-log" id="settle-log"></div>
+        <div class="settle-actions">
+          <button class="btn btn-ghost" id="settle-skip">跳过动画</button>
+          <button class="btn btn-primary" id="settle-done">继续筹划</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 顶部状态栏 72px -->
+  <header id="topbar">
+    <div class="tb-brand">
+      <span class="seal">十六国</span>
+      <span class="tb-sub">山河未定</span>
+    </div>
+    <div class="tb-date">
+      <span id="tb-year">383年</span><span class="tb-season" id="tb-season">秋</span>
+      <span class="tb-div">·</span>
+      <span id="tb-faction" class="fac-jin">东晋</span>
+      <span class="tb-div">·</span>
+      <span id="tb-phase">筹划阶段</span>
+      <span class="tb-div">·</span>
+      <span id="tb-turn" class="dim">第1回合</span>
+    </div>
+    <div class="tb-res" id="tb-res">
+      <div class="res" id="res-grain" tabindex="0">
+        <svg viewBox="0 0 24 24" class="res-ico"><path d="M12 3c-2 3-6 4-6 9a6 6 0 0 0 12 0c0-5-4-6-6-9Zm0 16v-6m-3 3 3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <b id="res-grain-v">12,400</b><span class="res-unit">石 · 粮秣</span>
+      </div>
+      <div class="res" id="res-gold" tabindex="0">
+        <svg viewBox="0 0 24 24" class="res-ico"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 9h6m-6 3h6m-3-3v8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></svg>
+        <b id="res-gold-v">3,800</b><span class="res-unit">钱 · 库帑</span>
+      </div>
+      <div class="res" id="res-troops" tabindex="0">
+        <svg viewBox="0 0 24 24" class="res-ico"><path d="M5 21v-8l7-5 7 5v8h-5v-5h-4v5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <b id="res-troops-v">9,500</b><span class="res-unit">人 · 可用兵力</span>
+      </div>
+      <div class="res res-todo" id="res-todo" tabindex="0">
+        <svg viewBox="0 0 24 24" class="res-ico"><rect x="5" y="4" width="14" height="17" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M9 2h6v4H9zM8.5 11l2 2 4-4M8.5 16.5l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <b id="res-todo-v">3</b><span class="res-unit">待办</span>
+      </div>
+    </div>
+    <div class="tb-btns">
+      <button class="btn btn-ghost tb-ico" id="btn-save" title="存档">存</button>
+      <button class="btn btn-ghost tb-ico" id="btn-settings2" title="设置">设</button>
+      <button class="btn btn-ghost tb-ico" id="btn-tochapter" title="返回时代选择">时</button>
+    </div>
+  </header>
+
+  <!-- 左侧地域栏 240px -->
+  <aside id="left-panel">
+    <div class="lp-tabs">
+      <button class="lp-tab active" data-tab="region">地域</button>
+      <button class="lp-tab" data-tab="legion">军团</button>
+      <button class="lp-tab" data-tab="todo">待办</button>
+      <button class="lp-fold" id="lp-fold" title="折叠">〈</button>
+    </div>
+    <div class="lp-body" id="lp-body"></div>
+  </aside>
+  <button id="lp-unfold" class="hidden" title="展开地域栏">〉</button>
+
+  <!-- 右侧情报栏 340px -->
+  <aside id="right-panel">
+    <div class="rp-tabs">
+      <button class="rp-tab active" data-tab="intel">侦报</button>
+      <button class="rp-tab" data-tab="council">军议</button>
+      <button class="rp-tab" data-tab="log">军需</button>
+    </div>
+    <div class="rp-body" id="rp-body"></div>
+  </aside>
+
+  <!-- 底部命令栏 136px -->
+  <footer id="command-bar">
+    <div class="cb-context" id="cb-context">未选中对象 —— 点击地图中的城池或军团</div>
+    <div class="cb-btns" id="cb-btns"></div>
+    <div class="cb-note" id="cb-note"></div>
+  </footer>
+
+  <!-- 推进回合 -->
+  <button id="end-turn">
+    <span class="et-main">推进回合</span>
+    <span class="et-sub" id="et-sub">先检查待处理军令</span>
+  </button>
+  <div id="et-preview" class="hidden"></div>
+</section>
+
+<!-- ══════════ 即时交锋 ══════════ -->
+<section id="screen-battle" class="screen">
+  <div id="bt-wrap">
+    <canvas id="bt-gl"></canvas>
+    <div id="bt-labels"></div>
+  </div>
+  <!-- 上方目标条 -->
+  <header id="bt-topbar">
+    <div class="bt-goal">
+      <span class="bt-goal-label">任务</span>
+      <span id="bt-goal-text">护送运输队通过淝水渡口</span>
+      <span class="bt-goal-stage" id="bt-stage">第一阶段 · 接敌</span>
+    </div>
+    <div class="bt-goal-opt" id="bt-goal-opt">可选 · 保存辎重过半 · 伤员撤离</div>
+    <div class="bt-clock">
+      <button class="btn bt-speed" data-speed="0">暂停 (空格)</button>
+      <button class="btn bt-speed" data-speed="0.5">0.5×</button>
+      <button class="btn bt-speed active" data-speed="1">1×</button>
+      <button class="btn bt-speed" data-speed="2">2×</button>
+      <span id="bt-timer">00:00</span>
+    </div>
+  </header>
+  <!-- 侧边军情 最多两条 -->
+  <aside id="bt-intel">
+    <div class="bt-intel-title">军情</div>
+    <div id="bt-intel-list"></div>
+  </aside>
+  <!-- 下方部队栏 -->
+  <footer id="bt-unitbar">
+    <div id="bt-units"></div>
+  </footer>
+  <!-- 右侧命令区 -->
+  <aside id="bt-commands">
+    <div class="btc-title" id="btc-title">军令 —— 刘牢之 · 护粮都督</div>
+    <div id="btc-btns"></div>
+    <div class="btc-note" id="btc-note">统一控制队伍，不逐兵操作。命令将显示「已收到/正在执行/受阻」。</div>
+    <div class="btc-scope">
+      <label><input type="checkbox" id="bt-takeover" checked> 以现场将领视角接管（遵守其视野与权限，无全图情报）</label>
+    </div>
+    <button class="btn btn-danger" id="bt-retreat-all">全军撤退</button>
+  </aside>
+  <div id="bt-result" class="hidden">
+    <div class="btr-card">
+      <h3 id="btr-title">交锋结束</h3>
+      <div id="btr-body"></div>
+      <button class="btn btn-primary" id="btr-ok">查看战报</button>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════ 覆盖层：城池 / 军团 / 军议 / 战报 / 人物 ══════════ -->
+<div id="overlay-root"></div>
+<div id="toast-root"></div>
+<div id="fader"></div>
+
+<!-- 设置 -->
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-card">
+    <h3>设置</h3>
+    <div class="set-row"><span>界面缩放</span>
+      <div class="seg" id="seg-uiscale">
+        <button data-v="100" class="active">100%</button><button data-v="125">125%</button><button data-v="150">150%</button>
+      </div>
+    </div>
+    <div class="set-row"><span>减少动态效果</span><label class="switch"><input type="checkbox" id="set-reduce"><i></i></label></div>
+    <div class="set-row"><span>高对比地图</span><label class="switch"><input type="checkbox" id="set-hicon"><i></i></label></div>
+    <div class="set-row"><span>提示音</span><label class="switch"><input type="checkbox" id="set-sound" checked><i></i></label></div>
+    <div class="set-row"><span>镜头转场</span>
+      <div class="seg" id="seg-cam">
+        <button data-v="fast" class="active">即时</button><button data-v="anim">0.4—0.8秒</button>
+      </div>
+    </div>
+    <div class="set-keys">
+      <b>键位</b> 滚轮缩放 · 中键拖拽 · Q/E 旋转 · Home 复位北向 · Esc 返回上层 · 空格 战术暂停
+    </div>
+    <div class="modal-actions"><button class="btn btn-primary" id="set-close">关闭</button></div>
+  </div>
+</div>
+
+<!-- 史料依据 -->
+<div id="modal-about" class="modal hidden">
+  <div class="modal-card modal-wide">
+    <h3>史料依据与界面原型说明</h3>
+    <div class="about-body">
+      <p>本原型依据《五胡十六国游戏3D界面与内容扩展设计方案》制作，为<b>阶段一「界面骨架」+ 阶段三「可玩闭环」切片</b>：时代选择、战区、城池、军议、战斗、战报六个关键页面完整可走通。</p>
+      <p>时代框架覆盖 304—439 年；439 年后标注为南北朝扩展。刘宋自 420 年开始，刘裕此前事迹仍显示东晋身份。王猛卒于 375 年，383 年军议中不会作为在场谋士发言。</p>
+      <p class="dim">界面数值均为交互占位，不代表真实历史兵力与地理；战役机制属于游戏设计，不等同于史料原文。正式制作需另行考据。</p>
+    </div>
+    <div class="modal-actions"><button class="btn btn-primary" id="about-close">关闭</button></div>
+  </div>
+</div>
+
+<script>window.__errs = []; window.onerror = function (m, s, l, c) { window.__errs.push(m + ' @' + (s || '').split('/').pop() + ':' + l + ':' + c); return false; };</script>
+<script src="js/lib/three.min.js"></script>
+<script src="js/data.js"></script>
+<script src="js/state.js"></script>
+<script src="js/audio.js"></script>
+<script src="js/map3d.js"></script>
+<script src="js/battle.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
