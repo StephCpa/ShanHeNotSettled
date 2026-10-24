@@ -168,6 +168,10 @@ SHL.UI = (function () {
     renderCommandBar();
     updateEndTurn();
     setBreadcrumb('theater');
+    // 恢复持久化的阶段：待处理交锋 / 待阅战报
+    const S0 = State.current();
+    if (S0.phase === '待交锋') setTimeout(promptBattle, 500);
+    else if (S0.phase === '待阅战报' && S0.lastBattleResult) setTimeout(() => openReport(S0.lastBattleResult), 500);
   }
 
   /* ═══════════════ 顶栏 ═══════════════ */
@@ -188,8 +192,9 @@ SHL.UI = (function () {
     // 资源悬停详情
     bindResDetail('res-grain', () => `
       <b>粮秣 ${S.res.grain.toLocaleString()} 石</b><br>
-      本回合预计收入 +${S.resDetail.grainIn}（江南漕运）<br>
-      本回合预计支出 −${S.resDetail.grainOut}（驻军口粮）<br>
+      下回合预计：入 +${S.resDetail.grainIn}（江南漕运）<br>
+      固定支出 −${S.resDetail.grainOut}（驻军口粮与马匹耗用）<br>
+      军令粮耗另计 —— 与「推进回合」执行预览同口径<br>
       <span class="dim">${esc(S.resDetail.note)}</span>`);
     bindResDetail('res-gold', () => `<b>库帑 ${S.res.gold.toLocaleString()} 钱</b><br>市易与赏赐之源<br><span class="dim">秋赋将入库 +${S.resDetail.goldIn}</span>`);
     bindResDetail('res-troops', () => `<b>可用兵力 ${S.res.troops.toLocaleString()} 人</b><br>含北府各营与斥候轻骑<br><span class="dim">不含伤员与守辎重之卒</span>`);
@@ -329,8 +334,9 @@ SHL.UI = (function () {
         const p = D.council.proposals.find(x => x.id === S.councilChosen);
         body.innerHTML += `
           <div class="proposal selected">
-            <h4>已拟军令 · 方案${esc(p.id)} ${esc(p.name)}<span class="p-kind">${esc(p.kind)}</span></h4>
+            <h4>军议已定 · 方案${esc(p.id)} ${esc(p.name)}<span class="p-kind">${esc(p.kind)}</span></h4>
             <div class="p-row"><b>预览</b>${esc(p.preview)}</div>
+            <div class="p-row"><b>状态</b>草案已拟 —— 明确下令后进入待执行队列</div>
           </div>`;
       }
     } else if (ui.rpTab === 'council') {
@@ -626,11 +632,12 @@ SHL.UI = (function () {
     };
     $('#settle-done').onclick = () => {
       SHL.Audio.turn();
+      const done = State.takeSettle();   // 清除结算锁，恢复可推进状态
       ov.classList.add('hidden');
       updateTopbar(); renderLeftPanel(); renderRightPanel(); renderCommandBar(); updateEndTurn();
       SHL.Map3D.refreshLegions(); SHL.Map3D.refreshIntel();
       SHL.Map3D.clearMarchArrows();
-      if (r.battleTrigger) {
+      if ((done && done.battleTrigger) || State.current().phase === '待交锋') {
         setTimeout(promptBattle, 250);
       }
     };
@@ -638,7 +645,9 @@ SHL.UI = (function () {
 
   /* ═══════════════ 交锋提示 ═══════════════ */
   function promptBattle() {
+    if (State.current().phase !== '待交锋') return;   // 已处理过则不再弹
     SHL.Audio.alert();
+    const assess = SHL.Battle.assessPlayerForce(State.current());
     const mask = document.createElement('div');
     mask.className = 'ov-mask';
     mask.innerHTML = `
@@ -646,41 +655,29 @@ SHL.UI = (function () {
         <h3 style="font-family:var(--f-title);font-size:24px;letter-spacing:4px;margin-bottom:10px">渡口 · 关键交锋</h3>
         <p style="font-size:14px;line-height:2">秦军前锋扑向渡口粮道。是否<b style="color:var(--zhusha)">亲自指挥</b>？</p>
         <p class="dim" style="font-size:13px;line-height:1.9">亲自指挥：以${esc(D.battleDukou.commanderName)}视角调度六个单位（2—5分钟）。<br>
-        委任：交由现场将领按预案处理，仍按同一战斗模型结算。</p>
+        委任：交由现场将领按预案处理，<b>仍按同一战斗模型结算</b>，只改命令来源。</p>
+        <p class="dim" style="font-size:12.5px;line-height:1.8">当前继承：北府作战兵力 ${assess.total.toLocaleString()} 人 · 载粮 ${assess.grainLoad.toLocaleString()} 石 —— 战略准备直接决定战场输入。</p>
         <div style="display:flex;gap:12px;margin-top:18px">
-          <button class="btn primary" id="pb-live" style="flex:1;justify-content:center">亲自指挥</button>
+          ${assess.canLiveCommand
+            ? '<button class="btn primary" id="pb-live" style="flex:1;justify-content:center">亲自指挥</button>'
+            : '<button class="btn disabled" disabled style="flex:1;justify-content:center">亲自指挥<span class="reason">可用兵力不足</span></button>'}
           <button class="btn" id="pb-deleg" style="flex:1;justify-content:center">委任将领</button>
         </div>
       </div>`;
     document.body.appendChild(mask);
-    mask.querySelector('#pb-live').addEventListener('click', () => {
-      mask.remove();
-      startBattle(false);
-    });
     mask.querySelector('#pb-deleg').addEventListener('click', () => {
       mask.remove();
       startBattle(true);
     });
+    const liveBtn = mask.querySelector('#pb-live');
+    if (liveBtn) liveBtn.addEventListener('click', () => { mask.remove(); startBattle(false); });
   }
 
   function startBattle(delegated) {
     if (delegated) {
-      // 委任：同一战斗模型快速结算（确定性伪随机）
-      const seed = D.battleDukou.seed;
-      const rnd = mulberry(seed);
-      const win = rnd() > 0.28;
-      const losses = { player: win ? 240 + Math.round(rnd() * 260) : 480 + Math.round(rnd() * 400), enemy: win ? 500 + Math.round(rnd() * 500) : 260 + Math.round(rnd() * 300) };
-      const convoyHp = win ? 0.55 + rnd() * 0.45 : 0.15 + rnd() * 0.4;
-      const result = {
-        win, text: win ? '都督按预案护粮强渡，粮车未失。' : '敌锋锐利，护送失利，弃车而还。',
-        losses, convoyHp, wounded: Math.round(losses.player * 0.3), time: 0,
-        assumptions: [
-          { k: '「敌约三千，无浮桥」', ok: true, note: '与核实情报相符' },
-          { k: '「浅滩可快速通过」', ok: convoyHp > 0.5, note: convoyHp > 0.5 ? '浅滩通过顺利' : '浅滩受阻，辎重损失过半' },
-          { k: '「林缘可覆盖渡口」', ok: win, note: win ? '弩手保持东岸位' : '交战过烈，火力中断' },
-        ],
-        delegated: true,
-      };
+      // 委任：headless 复跑同一战斗模拟器（与亲自指挥共用模型）
+      const input = SHL.Battle.deriveInput(State.current());
+      const result = SHL.Battle.simulateDelegated(input);
       State.writeBattleResult(result);
       openReport(result);
       return;
@@ -693,14 +690,6 @@ SHL.UI = (function () {
         openReport(result);
       },
     });
-  }
-  function mulberry(a) {
-    return function () {
-      a |= 0; a = a + 0x6D2B79F5 | 0;
-      let t = Math.imul(a ^ a >>> 15, 1 | a);
-      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-      return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    };
   }
 
   /* ═══════════════ 城池详情 ═══════════════ */
@@ -880,6 +869,7 @@ SHL.UI = (function () {
             <div class="march-preview" id="lg-mpreview"></div>
             <h3>执行中的军令</h3>
             <div id="lg-orders" style="font-size:13px;line-height:2"></div>
+            <div id="lg-march" style="font-size:13px;line-height:2"></div>
             <h3 style="margin-top:12px">风险</h3>
             <div style="font-size:13px;line-height:1.9" id="lg-risks"></div>
           </div>
@@ -902,7 +892,11 @@ SHL.UI = (function () {
       const orders = State.ordersOfLegion(id);
       $('#lg-orders').innerHTML = orders.length
         ? orders.map(o => `· ${esc(o.kind === 'escort' ? '护送' : o.kind === 'scout' ? '侦察' : '行军')} → ${esc(o.toName || '')}（${o.turns}回合）<br>`).join('')
-        : '<span class="dim">暂无 —— 关闭后可在地图上右键目标预览行军。</span>';
+        : '<span class="dim">队列暂无新令。</span>';
+      const m = L2.march;
+      $('#lg-march').innerHTML = m
+        ? `· 在途：${esc(m.path.map(State.nodeName).join(' → '))}（余 ${(m.path.length - 1) - m.progress} 回合）`
+        : '';
       const risks = [];
       if (L2.fatigue > 40) risks.push('疲劳偏高，持续作战能力下降');
       if (L2.supplyDays < 12) risks.push('粮秣可支撑日数偏低');
@@ -926,6 +920,7 @@ SHL.UI = (function () {
 
   /* ═══════════════ 军议 ═══════════════ */
   let councilProposal = null;
+  let councilDraft = null;   // 草案独立保存：明确下令时才一次性入队
   function openCouncil() {
     const S = State.current();
     const ch = D.council;
@@ -985,8 +980,9 @@ SHL.UI = (function () {
         </div>
       </div>`;
     document.body.appendChild(mask);
-    mask.querySelector('.ov-close').addEventListener('click', () => mask.remove());
-    mask.addEventListener('click', (e) => { if (e.target === mask) mask.remove(); });
+    const closeCouncil = () => { councilDraft = null; mask.remove(); };
+    mask.querySelector('.ov-close').addEventListener('click', closeCouncil);
+    mask.addEventListener('click', (e) => { if (e.target === mask) closeCouncil(); });
 
     mask.querySelectorAll('.proposal').forEach(el => el.addEventListener('click', () => {
       councilProposal = el.dataset.pid;
@@ -1015,30 +1011,48 @@ SHL.UI = (function () {
       const S2 = State.current();
       const p = ch.proposals.find(x => x.id === councilProposal);
       S2.councilChosen = councilProposal;
-      let draft = '';
+      /* —— 仅生成草案，不入队：明确下令时才校验并入队一次 —— */
+      const draft = { proposal: p.id, orders: [] };
       if (p.id === 'A') {
-        State.addOrder({ kind: 'scout', legionId: 'scouts', label: '斥候乙队', grain: 20, turns: 1, from: 'dukou', to: 'dukou', fromName: '渡口', toName: '渡口', path: ['camp', 'dukou'], desc: '增派侦察，核实后再动' });
-        draft = `执行单位：斥候乙队<br>路线：东岸大营 → 渡口（往返）<br>时限：1回合<br>终止条件：回报核实或失联；失联则按过时情报处理`;
+        draft.orders.push({ kind: 'scout', legionId: 'scouts', label: '斥候乙队', grain: 20, turns: 1, from: 'dukou', to: 'dukou', fromName: '渡口', toName: '渡口', path: ['camp', 'dukou'], desc: '增派侦察，核实后再动' });
+        draft.text = `执行单位：斥候乙队<br>路线：东岸大营 → 渡口（往返）<br>时限：1回合<br>终止条件：回报核实或失联；失联则按过时情报处理`;
       } else if (p.id === 'B') {
-        State.addOrder({ kind: 'march', legionId: 'transport', label: '石仓运输队', grain: 240, turns: 2, from: 'liangdao', to: 'dukou', fromName: '粮道·三汊河', toName: '渡口', path: ['liangdao', 'reed', 'dukou'], desc: '改道经苇泽，承担额外粮耗' });
-        draft = `执行单位：石仓运输队<br>路线：三汊河 → 苇泽北缘 → 渡口<br>时限：2回合（多耗3日粮）<br>终止条件：辎重受袭即折回官道`;
+        const L = S2.legions.transport, step = L.stance === 'fast' ? 2 : 1;
+        const path = ['liangdao', 'reed', 'dukou'];
+        const turns = Math.max(1, Math.ceil((path.length - 1) / step));
+        draft.orders.push({ kind: 'march', legionId: 'transport', label: '石仓运输队', grain: 120 * turns, turns, from: 'liangdao', to: 'dukou', fromName: '粮道·三汊河', toName: '渡口', path, desc: '改道经苇泽，承担额外粮耗' });
+        draft.text = `执行单位：石仓运输队<br>路线：三汊河 → 苇泽北缘 → 渡口<br>时限：${turns}回合（多耗3日粮）<br>终止条件：辎重受袭即折回官道`;
       } else {
-        State.addOrder({ kind: 'escort', legionId: 'beifu', label: '北府先锋营', grain: 320, turns: 1, from: 'camp', to: 'dukou', fromName: '东岸大营', toName: '渡口', path: ['camp', 'bagong', 'dukou'], desc: '以一部掩护运输强渡' });
-        State.addOrder({ kind: 'escort', legionId: 'transport', label: '石仓运输队', grain: 0, turns: 1, from: 'liangdao', to: 'dukou', fromName: '粮道·三汊河', toName: '渡口', path: ['liangdao', 'reed', 'dukou'], desc: '随先锋营渡河' });
-        draft = `执行单位：北府先锋营（掩护）＋ 石仓运输队<br>路线：大营 → 八公山 → 渡口 强渡<br>时限：1回合 · 渡口将触发关键交锋<br>终止条件：粮车过河，或伤亡三成即退回东岸`;
+        const step = S2.legions.beifu.stance === 'fast' ? 2 : 1;
+        const pathB = ['camp', 'bagong', 'dukou'];
+        const turnsB = Math.max(1, Math.ceil((pathB.length - 1) / step));
+        const pathT = ['liangdao', 'reed', 'dukou'];
+        const turnsT = Math.max(1, Math.ceil((pathT.length - 1) / step));
+        draft.orders.push({ kind: 'escort', legionId: 'beifu', label: '北府先锋营', grain: 160 * turnsB, turns: turnsB, from: 'camp', to: 'dukou', fromName: '东岸大营', toName: '渡口', path: pathB, desc: '以一部掩护运输强渡' });
+        draft.orders.push({ kind: 'escort', legionId: 'transport', label: '石仓运输队', grain: 0, turns: turnsT, from: 'liangdao', to: 'dukou', fromName: '粮道·三汊河', toName: '渡口', path: pathT, desc: '随先锋营渡河' });
+        draft.text = `执行单位：北府先锋营（掩护）＋ 石仓运输队<br>路线：大营 → 八公山 → 渡口 强渡<br>时限：${turnsB}回合 · 抵渡后触发关键交锋<br>终止条件：粮车过河，或伤亡三成即退回东岸`;
       }
+      councilDraft = draft;
       $('#cv-draft').innerHTML = `
         <div class="junling-draft">
-          <h4>军令草案 <span class="ai-mark">地图预演已绘</span></h4>
-          ${draft}
+          <h4>军令草案 <span class="ai-mark">地图预演已绘 · 尚未入队</span></h4>
+          ${draft.text}
           <div style="display:flex;gap:10px;margin-top:10px">
             <button class="btn primary" id="jl-issue">明确下令</button>
-            <span class="dim">规则层验证后由你确认执行；推进回合前可撤销。</span>
+            <span class="dim">点「明确下令」才校验并加入队列；关闭本页则草案作废。</span>
           </div>
         </div>`;
       $('#jl-issue').addEventListener('click', () => {
+        if (!councilDraft) return;
+        // 重复确认防护：同军团同目标已在队列或在途，拒绝重复执行
+        const dup = councilDraft.orders.find(o =>
+          State.ordersOfLegion(o.legionId).some(q => q.kind === o.kind && q.to === o.to)
+          || (S2.legions[o.legionId] && S2.legions[o.legionId].march));
+        if (dup) { SHL.Audio.alert(); toast('同一军令已在队列或在途，不重复下达', ''); return; }
         SHL.Audio.confirm();
-        mask.remove();
+        councilDraft.orders.forEach(o => State.addOrder(o));   // 一次性入队
+        councilDraft = null;
+        closeCouncil();
         renderRightPanel(); updateEndTurn();
         toast('军令已入队 —— 推进回合后生效', 'good');
       });
@@ -1070,6 +1084,7 @@ SHL.UI = (function () {
                 <tr><td>我方伤亡</td><td><b class="num-neg">${result.losses.player}</b> 人</td><td>阵亡与重伤分列，伤员${result.wounded || 0}人需后送</td></tr>
                 <tr><td>敌方伤亡</td><td><b class="num-pos">${result.losses.enemy}</b> 人</td><td>含溃散，为估计值</td></tr>
                 <tr><td>辎重保存</td><td><b>${Math.round((result.convoyHp || 0) * 100)}%</b></td><td>粮车与随行军资</td></tr>
+                <tr><td>载粮结算</td><td><b>${result.grainLoad || 0}</b> 石</td><td>${result.win ? '交付折赋' : '残车退回粮道'}，损毁 ${Math.round((result.grainLoad || 0) * (1 - (result.convoyHp || 0)))} 石已自库存扣除</td></tr>
                 <tr><td>粮秣</td><td>已扣本回合消耗</td><td>资源账目由规则产生</td></tr>
               </table>
             </div>
@@ -1101,8 +1116,9 @@ SHL.UI = (function () {
         </div>
       </div>`;
     document.body.appendChild(mask);
-    mask.querySelector('.ov-close').addEventListener('click', () => { mask.remove(); afterReport(); });
-    mask.addEventListener('click', (e) => { if (e.target === mask) { mask.remove(); afterReport(); } });
+    const closeReport = () => { State.markReportViewed(); mask.remove(); afterReport(); };
+    mask.querySelector('.ov-close').addEventListener('click', closeReport);
+    mask.addEventListener('click', (e) => { if (e.target === mask) closeReport(); });
   }
   function afterReport() {
     updateTopbar(); renderLeftPanel(); renderRightPanel(); renderCommandBar(); updateEndTurn();
@@ -1199,6 +1215,7 @@ SHL.UI = (function () {
     showScreen, toast,
     buildChapterSelect, enterStrategy,
     updateTopbar, renderLeftPanel, renderRightPanel, renderCommandBar, updateEndTurn,
+    closeCity, closeLegion,
     pickNode, setBreadcrumb, setSiteBreadcrumb, showMarchPreview, cancelMarchPending,
     openCity, openLegion, openCouncil, openReport,
     promptBattle, startBattle,

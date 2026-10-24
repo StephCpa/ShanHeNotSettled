@@ -1,7 +1,10 @@
 /* ═════════════════════════════════════════════════
    十六国 · 山河未定 — 回合引擎与指令队列
-   命令先进队列，可编辑；推进回合前只汇总真正阻塞的问题；
-   结算不因折叠暂停；自动存档包含未完成指令与已解决交锋节点。
+   阶段机：筹划 → 结算（瞬态） → 筹划 / 待交锋 → 待阅战报 → 筹划
+   - 命令先进队列，可编辑；推进前只汇总真正阻塞的问题
+   - 行军逐回合推进，抵达/接敌事件触发交锋
+   - 交锋结果一次性回写（兵力按类型、辎重按载量）
+   - 阶段与待处理事件随存档持久化
    ═════════════════════════════════════════════════ */
 window.SHL = window.SHL || {};
 
@@ -9,37 +12,43 @@ SHL.State = (function () {
   'use strict';
   const D = SHL.DATA;
 
-  const SEASONS = ['春','夏','秋','冬'];
+  const SEASONS = ['春', '夏', '秋', '冬'];
+  const BASE_UPKEEP = 620;   // 驻军口粮与马匹耗用/回合（与界面预览一致）
 
-  let S = null;          // 当前局面
-  const listeners = {};  // 简单事件
+  let S = null;              // 当前局面（可持久化部分）
+  let settleRunner = null;   // 结算演出（瞬态，不进存档）
+  const listeners = {};
 
   function on(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); }
   function emit(ev, arg) { (listeners[ev] || []).forEach(f => f(arg)); }
+  function deepCopy(o) { return JSON.parse(JSON.stringify(o)); }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
   /* ───────── 初始化 ───────── */
   function newGame(perspective) {
+    settleRunner = null;
     S = {
-      version: 'proto-1.0', rules: 'rules-1.0',
+      version: 'proto-1.1', rules: 'rules-1.1',
       chapter: 'qin-tong', scenario: 'feishui',
-      perspective: perspective || 'jin',   // 东晋 / 前秦
+      perspective: perspective || 'jin',
       mode: 'history',
-      turn: 1, year: 383, seasonIdx: 2,    // 383年 秋
-      phase: '筹划',
+      turn: 1, year: 383, seasonIdx: 2,
+      phase: '筹划',                 // 筹划 | 结算 | 待交锋 | 待阅战报
       weather: '晴，淮上有薄雾',
       res: { grain: 12400, gold: 3800, troops: 9500 },
-      resDetail: { grainIn: 260, grainOut: 340, goldIn: 120, note: '江南漕运秋赋将至' },
+      resDetail: { grainIn: 260, grainOut: BASE_UPKEEP, goldIn: 120, note: '江南漕运秋赋将至' },
       legions: deepCopy(D.legions),
       intel: {
         dukou: { state: 'unverified', title: '渡口敌情待核', text: '西岸见炊烟数十处，兵力未辨', day: '一日前' },
+        verifiedTurn: 0,
       },
-      queue: [],          // 待执行军令
-      proposals: {},      // 军议选择记录
+      queue: [],
       councilChosen: null,
       todos: [],
       log: [],
-      battleDukouDone: null,   // 交锋结果回写标记，避免重复结算
-      epic: [],           // 人物史诗记录
+      battleDukouDone: null,
+      lastBattleResult: null,        // 待阅战报使用
+      epic: [],
       flags: { scoutedDukou: false, routeChanged: false, escortStarted: false },
     };
     addTodo('intel', '渡口敌情待核', '侦报尚未交叉验证 —— 到军议中处置', 'dukou');
@@ -48,8 +57,6 @@ SHL.State = (function () {
     pushLog('回合1 · 开局', '洛涧已破，秦军沿淝水西岸列阵。东岸筹谋，正待将令。');
     save();
   }
-
-  function deepCopy(o) { return JSON.parse(JSON.stringify(o)); }
 
   /* ───────── 待办 ───────── */
   function addTodo(kind, title, desc, anchor) {
@@ -63,7 +70,6 @@ SHL.State = (function () {
   }
 
   /* ───────── 军令队列 ───────── */
-  // order: {id, kind:'march'|'escort'|'scout'|'stance'|'other', legionId, from, to, label, turns, grain, desc, conflict}
   function addOrder(o) {
     o.id = 'ord' + Date.now() + Math.random().toString(36).slice(2, 5);
     S.queue.push(o);
@@ -73,10 +79,8 @@ SHL.State = (function () {
   function removeOrder(id) { S.queue = S.queue.filter(q => q.id !== id); emit('queue'); }
   function ordersOfLegion(lid) { return S.queue.filter(q => q.legionId === lid); }
 
-  /* 阻塞性冲突检查：推进回合前只汇总真正阻塞的问题 */
   function blockingIssues() {
     const issues = [];
-    // 同一军团两条互斥行军令
     const byLegion = {};
     S.queue.forEach(q => {
       if (q.kind === 'march' || q.kind === 'escort') {
@@ -90,16 +94,14 @@ SHL.State = (function () {
         issues.push(`${L ? L.name : lid} 同时有多条移动军令，须先取舍。`);
       }
     });
-    // 粮秣不足
-    const needGrain = S.queue.reduce((s, q) => s + (q.grain || 0), 0);
-    if (needGrain > S.res.grain) issues.push(`军令合计需粮 ${needGrain} 石，超过库存 ${S.res.grain} 石。`);
-    // 渡口情报未处理就推进（提示性，不阻塞）
+    const needGrain = S.queue.reduce((s, q) => s + (q.grain || 0), 0) + S.resDetail.grainOut;
+    if (needGrain > S.res.grain) issues.push(`本回合军需合计需粮 ${needGrain} 石，超过库存 ${S.res.grain} 石。`);
     return issues;
   }
 
   function softWarnings() {
     const w = [];
-    if (S.intel.dukou && S.intel.dukou.state === 'unverified' && !S.flags.scoutedDukou)
+    if (S.intel.dukou.state !== 'confirmed' && !S.flags.scoutedDukou)
       w.push('渡口情报尚未核实，相关军令存在未知路段风险。');
     const beifu = S.legions.beifu;
     if (beifu && beifu.fatigue > 50) w.push('北府先锋营疲劳过高，行军损耗将上升。');
@@ -107,7 +109,6 @@ SHL.State = (function () {
   }
 
   /* ───────── 推进回合 ───────── */
-  let settleRunner = null;
   function endTurn() {
     if (settleRunner) return { ok: false, reason: '结算进行中' };
     const issues = blockingIssues();
@@ -116,80 +117,106 @@ SHL.State = (function () {
     const lines = [];
     S.phase = '结算';
 
-    // 1. 侦察类军令先行
+    /* 1. 侦察类军令 → 情报核实 */
     S.queue.forEach(q => {
       if (q.kind === 'scout') {
         S.flags.scoutedDukou = true;
+        S.intel.verifiedTurn = S.turn;
+        S.intel.dukou = {
+          state: 'confirmed', title: '渡口敌情已核实',
+          text: '西岸为秦军前锋营，约三千骑步，无浮桥，正伐木为筏',
+          day: '本回合核实',
+        };
         lines.push({ t: '侦', text: `${q.label || '斥候乙队'} 亥时抵渡口西岸，核实完毕。`, cls: 'ev' });
       }
     });
 
-    // 2. 渡口情报更新（依据军议选择）
-    if (S.flags.scoutedDukou) {
-      S.intel.dukou = { state: 'confirmed', title: '渡口敌情已核实', text: '西岸为秦军前锋营，约三千骑步，无浮桥，正伐木为筏', day: '本回合核实' };
-      lines.push({ t: '报', text: '渡口核实：秦军前锋约三千，无浮桥，正伐木为筏。', cls: 'ev' });
-      resolveTodo('渡口敌情待核');
-    } else if (S.intel.dukou.state === 'unverified') {
-      S.intel.dukou.day = '二日前（情报过时）';
-      S.intel.dukou.state = 'stale';
+    /* 2. 情报老化（核实一回合后转过时） */
+    const I = S.intel.dukou;
+    if (I.state === 'confirmed' && S.turn - (S.intel.verifiedTurn || 0) >= 1) {
+      I.state = 'stale';
+      I.day = (S.turn - S.intel.verifiedTurn) + '回合前（情报过时）';
+      lines.push({ t: '报', text: '渡口情报已过时，西岸动向未知。', cls: '' });
+    } else if (I.state === 'unverified') {
+      I.state = 'stale';
+      I.day = (S.turn) + '回合仍无回报（情报过时）';
       lines.push({ t: '报', text: '渡口情报过时，仍未核实。西岸炊烟较昨更密。', cls: '' });
     }
 
-    // 3. 行军结算
+    /* 3. 消耗新军令 → 转为行军状态 */
+    let orderGrain = 0;
     S.queue.forEach(q => {
       if (q.kind === 'march' || q.kind === 'escort') {
         const L = S.legions[q.legionId];
         if (!L) return;
         const step = L.stance === 'fast' ? 2 : 1;
-        L.march = { path: q.path || [q.from, q.to], progress: 0, step, orderId: q.id, label: q.label };
-        L.supplyDays -= (q.turns || 1) * 2;
-        L.fatigue = Math.min(100, L.fatigue + (L.stance === 'fast' ? 18 : 8));
+        L.march = { path: q.path || [q.from, q.to], progress: 0, step, kind: q.kind };
+        L.supplyDays = Math.max(0, L.supplyDays - (q.turns || 1) * 2);
+        orderGrain += (q.grain || 0);
         lines.push({ t: '行', text: `${L.name} 自 ${q.fromName || '现地'} 出发（${stanceName(L.stance)}），预计 ${q.turns} 回合抵 ${q.toName || q.to}。`, cls: 'good' });
         if (q.kind === 'escort' && !S.flags.escortStarted) {
           S.flags.escortStarted = true;
           lines.push({ t: '护', text: '运输队随行，粮车两百乘出三汊河。', cls: '' });
         }
-      }
-      if (q.kind === 'stance') {
+      } else if (q.kind === 'stance') {
         const L = S.legions[q.legionId];
         if (L) { L.stance = q.stance; lines.push({ t: '令', text: `${L.name} 行军态势改为「${stanceName(q.stance)}」。`, cls: '' }); }
       }
     });
+    S.queue = [];
 
-    // 4. 触发渡口交锋（护送抵达渡口且未结算过）
+    /* 4. 逐回合推进在途行军；抵达触发事件 */
     let battleTrigger = false;
-    if (S.flags.escortStarted && !S.battleDukouDone) {
-      const T = S.legions.transport, B = S.legions.beifu;
-      if (T && (T.node === 'dukou' || (T.march && T.march.path.includes('dukou')) || true)) {
-        battleTrigger = true;
-        lines.push({ t: '战', text: '秦军前锋扑向渡口粮道 —— 关键交锋节点，需决定是否亲自指挥。', cls: 'ev' });
+    Object.values(S.legions).forEach(L => {
+      if (!L.march) return;
+      const M = L.march;
+      M.progress = Math.min(M.path.length - 1, M.progress + M.step);
+      L.node = M.path[M.progress];
+      L.fatigue = clamp(L.fatigue + (M.step > 1 ? 14 : 7), 0, 100);
+      const remain = (M.path.length - 1) - M.progress;
+      if (M.progress >= M.path.length - 1) {
+        lines.push({ t: '行', text: `${L.name} 抵达${nodeName(L.node)}。`, cls: 'good' });
+        L.march = null;
+        if (L.id === 'transport' && L.node === 'dukou' && !S.battleDukouDone) {
+          battleTrigger = true;
+          lines.push({ t: '战', text: '运输队行至渡口，与秦军前锋接敌 —— 关键交锋节点，需决定是否亲自指挥。', cls: 'ev' });
+        } else if (L.node === 'dukou' && L.id !== 'transport' && !S.battleDukouDone) {
+          lines.push({ t: '报', text: `${L.name} 于渡口西望，见秦军前锋营垒，暂未接战。`, cls: '' });
+        }
+      } else {
+        lines.push({ t: '行', text: `${L.name} 行至${nodeName(L.node)}（余 ${remain} 回合）。`, cls: '' });
       }
-    }
+    });
 
-    // 5. 资源与时间
-    const grainBurn = 620 + S.queue.reduce((s, q) => s + (q.grain || 0), 0);
-    S.res.grain -= grainBurn;
+    /* 5. 资源与时间（预览与结算同一口径） */
+    const income = S.resDetail.grainIn, upkeep = S.resDetail.grainOut;
+    S.res.grain += income - (upkeep + orderGrain);
     S.res.gold += S.resDetail.goldIn;
+    S.res.troops = countTroops();
     S.turn += 1;
     S.seasonIdx = (S.seasonIdx + 1) % 4;
     if (S.seasonIdx === 0) S.year += 1;
     S.weather = pickWeather(S.seasonIdx);
-    lines.push({ t: '计', text: `大军消耗粮秣 ${grainBurn} 石，存 ${S.res.grain} 石。时入${SEASONS[S.seasonIdx]}，${S.weather}。`, cls: '' });
+    const net = income - upkeep - orderGrain;
+    lines.push({ t: '计', text: `粮秣 ${net >= 0 ? '+' : ''}${net} 石（入${income}·耗${upkeep + orderGrain}），存 ${S.res.grain} 石。时入${SEASONS[S.seasonIdx]}，${S.weather}。`, cls: net < 0 ? '' : 'good' });
     if (S.res.grain < 3000) lines.push({ t: '警', text: '粮秣告急！江南漕运未至，须速定护粮之策。', cls: 'ev' });
 
-    // 6. 清队列
-    S.queue = [];
-    S.phase = '筹划';
-
-    // 7. 新待办
-    if (S.intel.dukou.state !== 'confirmed' && !S.flags.scoutedDukou)
+    /* 6. 阶段与待办 */
+    S.phase = battleTrigger ? '待交锋' : '筹划';
+    if (I.state !== 'confirmed' && !S.flags.scoutedDukou && S.turn > 2)
       addTodo('intel', '渡口敌情仍待核', '侦报已过时 —— 军议需重定方案', 'dukou');
     if (S.res.grain < 5000) addTodo('log', '粮秣告急', '存粮不足五千石，查看军需账目', 'granary');
 
-    pushLog(`回合${S.turn}`, lines.map(l => l.text).join(' '));
+    pushLog(`回合${S.turn - 1}`, lines.map(l => l.text).join(' '));
     settleRunner = { lines, battleTrigger };
     save();
     return { ok: true, lines, battleTrigger };
+  }
+
+  function countTroops() {
+    return Object.values(S.legions)
+      .filter(L => !L.intel)
+      .reduce((s, L) => s + (L.infantry + L.cavalry + L.archer), 0);
   }
 
   function pickWeather(season) {
@@ -205,34 +232,64 @@ SHL.State = (function () {
 
   function takeSettle() { const r = settleRunner; settleRunner = null; return r; }
   function settlePending() { return !!settleRunner; }
-
   function stanceName(s) { return s === 'fast' ? '急行' : s === 'avoid' ? '避敌' : '稳行'; }
+  function nodeName(id) { const n = D.theaterHuainan.nodes[id]; return n ? n.name : id; }
 
-  /* ───────── 交锋回写（只回写一次） ───────── */
+  /* ───────── 交锋回写（一次性，按类型扣减） ───────── */
   function writeBattleResult(result) {
     if (S.battleDukouDone) return false;
-    S.battleDukouDone = result;
+    S.battleDukouDone = {
+      win: result.win, text: result.text, time: result.time,
+      losses: result.losses, convoyHp: result.convoyHp,
+    };
+    const ld = result.lossDetail || { player: {}, enemy: {} };
     const beifu = S.legions.beifu;
+    const transport = S.legions.transport;
     if (beifu) {
-      beifu.fatigue = Math.min(100, beifu.fatigue + 25);
-      beifu.morale = Math.max(20, Math.min(100, beifu.morale + (result.win ? 6 : -10)));
-      beifu.infantry -= (result.losses.player || 0);
-      if (beifu.infantry < 0) beifu.infantry = 0;
+      beifu.infantry = Math.max(0, beifu.infantry - (ld.player.infantry || 0));
+      beifu.cavalry = Math.max(0, beifu.cavalry - (ld.player.cavalry || 0));
+      beifu.archer = Math.max(0, beifu.archer - (ld.player.archer || 0));
+      beifu.morale = clamp(beifu.morale + (result.win ? 6 : -10), 20, 100);
+      beifu.fatigue = clamp(beifu.fatigue + 22, 0, 100);
       beifu.node = 'dukou';
+      beifu.march = null;
     }
-    if (S.legions.transport) S.legions.transport.node = result.win ? 'dukou' : 'liangdao';
-    if (result.grainSaved != null) {
-      S.res.grain += 0; // 粮车回写已在 battle 内计算
+    if (transport) {
+      transport.infantry = Math.max(0, transport.infantry - (ld.player.convoy || 0));
+      const load = result.grainLoad || transport.grainLoad || 0;
+      const lost = Math.round(load * (1 - clamp(result.convoyHp || 0, 0, 1)));
+      const saved = Math.round(load * clamp(result.convoyHp || 0, 0, 1));
+      if (result.win) {
+        // 完整交付：护送成功即离境折赋，损毁部分自库存扣除
+        S.res.grain = Math.max(0, S.res.grain - lost);
+        S.res.gold += Math.round(saved * 0.05);
+        transport.grainLoad = 0;
+        transport.node = 'dukou';
+      } else {
+        // 护送失败：残车退回粮道，所存即未损部分
+        S.res.grain = Math.max(0, S.res.grain - lost);
+        transport.grainLoad = saved;
+        transport.node = 'liangdao';
+      }
+      transport.march = null;
     }
+    S.res.troops = countTroops();
     S.epic.push({
       char: 'liulaozhi', node: '渡口护粮', year: S.year,
       text: `${result.win ? '督粮车渡淝水，挫秦军前锋。' : '粮道受阻，敛兵退还东岸。'}（本局推演）`,
     });
     resolveTodo('秋赋护送待定');
     addTodo('report', '渡口战报待阅', '交锋已结算 —— 查看战报与史鉴', 'dukou');
-    pushLog(`回合${S.turn} · 交锋`, `渡口护粮之战：我军伤亡${result.losses.player || 0}，敌军伤亡${result.losses.enemy || 0}，辎重保存${Math.round((result.convoyHp || 0) * 100)}%。`);
+    pushLog(`回合${S.turn - 1} · 交锋`, `渡口护粮之战：我方伤亡${result.losses.player}，敌方伤亡${result.losses.enemy}，辎重保存${Math.round((result.convoyHp || 0) * 100)}%。`);
+    S.lastBattleResult = result;
+    S.phase = '待阅战报';
     save();
     return true;
+  }
+
+  function markReportViewed() {
+    if (S.phase === '待阅战报') { S.phase = '筹划'; save(); }
+    resolveTodo('渡口战报待阅');
   }
 
   /* ───────── 史料页数据（史载 / 争议 / 推演 三分） ── */
@@ -255,26 +312,30 @@ SHL.State = (function () {
       const raw = localStorage.getItem(KEY);
       if (!raw) return false;
       const o = JSON.parse(raw);
-      if (!o || o.version !== 'proto-1.0') return false;
-      S = o; return true;
+      if (!o || (o.version !== 'proto-1.1' && o.version !== 'proto-1.0')) return false;
+      if (o.version === 'proto-1.0') return false; // 旧版规则已变，直接弃档
+      S = o;
+      if (!S.lastBattleResult) S.lastBattleResult = null;
+      settleRunner = null;
+      if (S.phase === '结算') S.phase = '筹划';
+      return true;
     } catch (e) { return false; }
   }
-  function hasSave() { try { return !!localStorage.getItem(KEY); } catch (e) { return false; } }
+  function hasSave() { try { const r = localStorage.getItem(KEY); if (!r) return false; try { const o = JSON.parse(r); return o.version === 'proto-1.1'; } catch (e) { return false; } } catch (e) { return false; } }
   function clearSave() { try { localStorage.removeItem(KEY); } catch (e) {} }
   function current() { return S; }
 
-  pushLog = function (turn, text) {
+  function pushLog(turn, text) {
     S.log.unshift({ turn, text, time: Date.now() });
     if (S.log.length > 60) S.log.pop();
     emit('log');
-  };
-  var pushLog; // hoisted usage
+  }
 
   return {
     newGame, current, save, load, hasSave, clearSave,
     addOrder, removeOrder, ordersOfLegion, blockingIssues, softWarnings,
-    endTurn, takeSettle, settlePending, stanceName,
-    writeBattleResult, addTodo, resolveTodo,
-    history, SEASONS, on, emit,
+    endTurn, takeSettle, settlePending, stanceName, nodeName,
+    writeBattleResult, markReportViewed, addTodo, resolveTodo,
+    history, SEASONS, BASE_UPKEEP, on, emit,
   };
 })();

@@ -48,9 +48,13 @@ window.SHL = window.SHL || {};
 
   function onLevelChanged(lv) {
     if (lv === 'esc') {
-      // Esc：关闭最上层，或战区→天下
+      // Esc：走各覆盖层自己的关闭通道（含 3D 场景 dispose），或战区→天下
       const overlay = document.querySelector('.ov-mask');
-      if (overlay) { overlay.remove(); return; }
+      if (overlay) {
+        const closer = overlay.querySelector('.ov-close');
+        if (closer) closer.click(); else overlay.remove();
+        return;
+      }
       if ($('#settle-overlay') && !$('#settle-overlay').classList.contains('hidden')) return;
       if (SHL.Map3D.getLevel() === 'theater') {
         SHL.Map3D.switchLevel('world');

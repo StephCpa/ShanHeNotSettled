@@ -1,8 +1,14 @@
 /* ═══════════════════════════════════════════════════════════
    十六国 · 山河未定 — 关键即时交锋（护粮渡河）
    §09: 上方目标条 / 中央战场 / 下方部队栏(6单位) / 右侧命令区 / 侧边军情(≤2)
-   战术暂停 + 0.5/1/2倍速；进入战场继承兵力士气疲劳补给天气；
-   自动处理与亲自指挥共用战斗模型；完成后只回写一次。
+
+   结构：纯数据模拟核心（createSim）+ 表现层绑定。
+   亲自指挥与委任将领走同一套战斗规则，只差命令来源：
+   - 亲自指挥：玩家逐队下令，实时步进
+   - 委任：headless 复跑同一模拟器，按预案自动下令
+
+   进入战场继承战略状态（兵力/士气/疲劳/载粮）；
+   完成后一次性产出结果（按类型战损 + 辎重比例），由 State 回写。
    ═══════════════════════════════════════════════════════════ */
 window.SHL = window.SHL || {};
 
@@ -10,155 +16,357 @@ SHL.Battle = (function () {
   'use strict';
   const D = SHL.DATA;
 
-  let renderer, scene, camera, canvas, raycaster;
-  let running = false, paused = false, speed = 1, elapsed = 0;
-  let units = [], selected = null, cfg = null;
-  let onResult = null;
-  let raf = 0, alive = false;
-  let labelHost, alerts = [];
-  let lastResult = null;
-  let grainSaved = 1, playerLosses = 0, enemyLosses = 0;
-  let stageIdx = 0;
-  const STAGES = ['第一阶段 · 接敌', '第二阶段 · 抢渡', '第三阶段 · 脱离'];
-  let ended = false;
+  const WORLD = { w: 120, h: 100 };
+  const NX = 0.34, NW = 0.045, CY = 0.52, CW = 0.06;  // 淝水与浅滩（归一化）
 
-  /* ── 地形查询 ── */
-  const RIVER = { x: 0.34, w: 0.045 };         // 淝水竖向（归一化坐标）
-  const CROSS = { y: 0.52, w: 0.06 };          // 浅滩位置
-  let hill = { x: 0.55, y: 0.22 };
-  let woods = [];
-
-  function isRiver(nx, nz) { return Math.abs(nx - RIVER.x) < RIVER.w && !(Math.abs(nz - CROSS.y) < CROSS.w); }
-  function isShallow(nx, nz) { return Math.abs(nx - RIVER.x) < RIVER.w && Math.abs(nz - CROSS.y) < CROSS.w; }
-  function inWoods(nx, nz) { return woods.some(w => Math.hypot(nx - w.x, nz - w.y) < w.r); }
-  function onHill(nx, nz) { return Math.hypot(nx - hill.x, nz - hill.y) < 0.09; }
-  function groundY(nx, nz) {
-    let y = 0;
-    if (isRiver(nx, nz)) y = -0.55;
-    else if (isShallow(nx, nz)) y = -0.28;
-    else if (onHill(nx, nz)) y = 2.6 * Math.max(0, 1 - Math.hypot(nx - hill.x, nz - hill.y) / 0.09);
-    return y;
+  /* ═══════════════ 模拟核心（无渲染依赖） ═══════════════ */
+  function nx2wx(nx) { return (nx - 0.5) * WORLD.w; }
+  function nz2wz(nz) { return (nz - 0.5) * WORLD.h; }
+  function isRiverW(x, z) { const nx = x / WORLD.w + 0.5, nz = z / WORLD.h + 0.5; return Math.abs(nx - NX) < NW && !(Math.abs(nz - CY) < CW); }
+  function isShallowW(x, z) { const nx = x / WORLD.w + 0.5, nz = z / WORLD.h + 0.5; return Math.abs(nx - NX) < NW && Math.abs(nz - CY) < CW; }
+  function groundYW(x, z, hill) {
+    if (isRiverW(x, z)) return -0.55;
+    if (isShallowW(x, z)) return -0.28;
+    if (hill) {
+      const d = Math.hypot(x - nx2wx(hill.x), z - nz2wz(hill.y));
+      if (d < 0.09 * WORLD.w) return 2.6 * Math.max(0, 1 - d / (0.09 * WORLD.w));
+    }
+    return 0;
   }
 
-  /* ═══════════ 启动 ═══════════ */
-  function start(opts) {
-    cfg = D.battleDukou;
-    onResult = opts.onResult;
-    canvas = document.getElementById('bt-gl');
-    labelHost = document.getElementById('bt-labels');
-    labelHost.innerHTML = '';
-    ended = false; elapsed = 0; paused = false; speed = 1;
-    grainSaved = 1; playerLosses = 0; enemyLosses = 0; stageIdx = 0;
-    alerts = [];
-
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xE9E1CB);
-    scene.fog = new THREE.Fog(0xE9E1CB, 60, 190);
-    scene.add(new THREE.HemisphereLight(0xFFF8E8, 0x8A7A5C, 1.05));
-    const sun = new THREE.DirectionalLight(0xFFF2D8, 0.85); sun.position.set(30, 60, 20); scene.add(sun);
-
-    buildTerrain();
-
-    // 单位
-    units = [];
-    const S = SHL.State.current();
-    cfg.playerUnits.forEach(u => {
-      units.push(makeUnit(u, 'player', {
-        moraleShift: S ? 0 : 0,
-      }));
-    });
-    cfg.enemyUnits.forEach(u => units.push(makeUnit(u, 'enemy', {})));
-
-    camera = new THREE.PerspectiveCamera(44, 2, 0.1, 500);
-    camera.position.set(28, 34, 62);
-    camera.lookAt(10, 0, 8);
-
-    raycaster = new THREE.Raycaster();
-    bindInput();
-    resize();
-    buildUnitBar();
-    setAlert('敌前锋自西岸渡口以东集结，正寻我粮车。', 'threat');
-    setAlert('建议：弩手据东岸林缘，可覆盖浅滩。', 'sugg');
-    alive = true;
-    running = true;
-    loop();
-    updateGoal();
-  }
-
-  /* ═══════════ 地形 ═══════════ */
-  function buildTerrain() {
-    // 地面
-    const geo = new THREE.PlaneGeometry(120, 100, 60, 50);
-    geo.rotateX(-Math.PI / 2);
-    const pos = geo.attributes.position;
-    const colors = new Float32Array(pos.count * 3);
-    const cLow = new THREE.Color(0xD5CBAE), cGrass = new THREE.Color(0x9FA489), cSand = new THREE.Color(0xC9BC97);
-    hill = cfg.terrain.hill;
-    woods = [
-      { x: cfg.terrain.woodsEast[0], y: cfg.terrain.woodsEast[1], r: 0.10 },
-      { x: cfg.terrain.woodsWest[0], y: cfg.terrain.woodsWest[1], r: 0.08 },
+  function createSim(cfg, input) {
+    const hill = cfg.terrain.hill;
+    const RIVERWX = nx2wx(NX), CROSSZ = nz2wz(CY);
+    const EXITX = (cfg.exitZone.x1 - 0.5) * WORLD.w + 4;
+    const EXITZ = ((cfg.exitZone.y1 + cfg.exitZone.y2) / 2 - 0.5) * WORLD.h;
+    const WINX = (cfg.exitZone.x1 - 0.5) * WORLD.w + 5;
+    // 粮车路径节点：东岸入口 → 浅滩中心 → 西岸河道外 → 撤离区
+    const WAYPOINTS = [
+      { x: -13, z: CROSSZ },
+      { x: RIVERWX - 4, z: CROSSZ },
+      { x: RIVERWX - 22, z: EXITZ },
+      { x: EXITX, z: EXITZ },
     ];
-    for (let i = 0; i < pos.count; i++) {
-      const x = pos.getX(i), z = pos.getZ(i);
-      const nx = x / 120 + 0.5, nz = z / 100 + 0.5;
-      let y = 0;
-      if (isRiver(nx, nz)) y = -0.6;
-      else if (isShallow(nx, nz)) y = -0.3;
-      if (onHill(nx, nz)) y = 2.8 * Math.max(0, 1 - Math.hypot(nx - hill.x, nz - hill.y) / 0.09);
-      pos.setY(i, y);
-      const c = isRiver(nx, nz) || isShallow(nx, nz) ? cSand.clone().lerp(new THREE.Color(0x54768A), 0.6)
-        : cLow.clone().lerp(cGrass, (Math.sin(nx * 40) * Math.cos(nz * 30) + 1) / 2 * 0.5);
-      colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+
+    const units = [];
+    function addU(u, side) {
+      const col = side === 'player' ? D.factions.jin.color : D.factions.qin.color;
+      units.push({
+        id: u.id, name: u.name, side,
+        type: u.type, isConvoy: !!u.isConvoy, reserve: !!u.reserve,
+        hp: u.strength, maxHp: u.strength, dmgTaken: 0,
+        morale: u.morale, fatigue: u.fatigue,
+        x: (u.start[0] - 0.5) * WORLD.w, z: (u.start[1] - 0.5) * WORLD.h,
+        order: u.reserve ? 'reserve' : (u.isConvoy ? 'advance' : 'hold'),
+        orderState: '待命', wpIdx: 0, moving: false, routed: false, dead: false,
+        speedBase: u.type === 'cavalry' ? 7.5 : u.type === 'wagon' ? 2.2 : u.type === 'archer' ? 4.6 : 5.4,
+        range: u.type === 'archer' ? 16 : u.type === 'cavalry' ? 5.5 : 6.5,
+        dps: u.type === 'archer' ? 9 : u.type === 'cavalry' ? 14 : 10,
+        engagedWith: null, warned: false,
+      });
     }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geo.computeVertexNormals();
-    scene.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true })));
-    // 水面
-    const water = new THREE.Mesh(new THREE.PlaneGeometry(6.5, 100), new THREE.MeshBasicMaterial({ color: 0x6F8A94, transparent: true, opacity: 0.75, depthWrite: false }));
-    water.rotation.x = -Math.PI / 2;
-    water.position.set((RIVER.x - 0.5) * 120, -0.35, 0);
-    scene.add(water);
-    // 浅滩标记（石梁）
-    for (let i = 0; i < 5; i++) {
-      const st = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.5, 2.2), new THREE.MeshLambertMaterial({ color: 0x9C8665 }));
-      st.position.set((RIVER.x - 0.5) * 120 + (i % 2 ? 1.4 : -1.4), -0.25, (CROSS.y + (i - 2) * 0.02 - 0.5) * 100);
-      scene.add(st);
-    }
-    // 树林
-    const rnd = SHL.Map3D ? null : null;
-    const tgeo = new THREE.ConeGeometry(1.1, 3.4, 5);
-    const tmat = new THREE.MeshLambertMaterial({ color: 0x4A554A, flatShading: true });
-    const inst = new THREE.InstancedMesh(tgeo, tmat, 130);
-    const m4 = new THREE.Matrix4();
-    let k = 0;
-    const rr = mulberry32(cfg.seed);
-    woods.forEach(w => {
-      for (let i = 0; i < 65; i++) {
-        const a = rr() * Math.PI * 2, d = Math.sqrt(rr()) * w.r * 120;
-        const x = (w.x - 0.5) * 120 + Math.cos(a) * d, z = (w.y - 0.5) * 100 + Math.sin(a) * d * 0.83;
-        if (isRiver(x / 120 + 0.5, z / 100 + 0.5)) continue;
-        const s = 0.55 + rr() * 0.5;
-        m4.makeScale(s, s, s);
-        m4.setPosition(x, 2.2 * s, z);
-        inst.setMatrixAt(k++, m4);
-      }
+
+    /* 玩家六队：按战略继承输入缩放 */
+    const inf = Math.max(0, Math.round(input.infantry || 0));
+    const cav = Math.max(0, Math.round(input.cavalry || 0));
+    const arch = Math.max(0, Math.round(input.archer || 0));
+    const p1 = Math.round(inf * 0.35), p2 = Math.round(inf * 0.35);
+    const p5 = Math.max(0, inf - p1 - p2);
+    const convoyHp = Math.min(420, Math.max(80, Math.round((input.grainLoad || 0) / 10)));
+    const P = { morale: input.morale || 70, fatigue: input.fatigue || 15 };
+    const inBy = (id) => cfg.playerUnits.find(u => u.id === id);
+    [p1, p2, p5, arch, cav, convoyHp].forEach((v, i) => {
+      const tpl = ['p1', 'p2', 'p5', 'p3', 'p4', 'p6'][i];
+      const u = { ...inBy(tpl), strength: v, morale: P.morale, fatigue: P.fatigue };
+      addU(u, 'player');
     });
-    inst.count = k;
-    scene.add(inst);
-    // 撤离区（西岸）
-    const ez = cfg.exitZone;
-    const exitPlane = new THREE.Mesh(new THREE.PlaneGeometry(9, 28), new THREE.MeshBasicMaterial({ color: 0x75816B, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide }));
-    exitPlane.rotation.x = -Math.PI / 2;
-    exitPlane.position.set((ez.x1 - 0.5) * 120 + 4.5, 0.06, ((ez.y1 + ez.y2) / 2 - 0.5) * 100);
-    scene.add(exitPlane);
-    const exitRing = new THREE.Mesh(new THREE.TorusGeometry(3.4, 0.18, 6, 24), new THREE.MeshBasicMaterial({ color: 0x4F5A4A }));
-    exitRing.rotation.x = Math.PI / 2;
-    exitRing.position.set(exitPlane.position.x, 0.12, exitPlane.position.z);
-    exitRing.name = 'exitRing';
-    scene.add(exitRing);
+    cfg.enemyUnits.forEach(u => addU(u, 'enemy'));
+    const grainLoad = Math.max(0, Math.round(input.grainLoad || 0));
+
+    const sim = {
+      units, grainLoad, time: 0, stage: 0, ended: false, events: [],
+      _alertT: 0, _p3EastT: 0, _p3AllT: 0.0001,
+      convoy() { return units.find(u => u.isConvoy); },
+      live(id) { const u = units.find(x => x.id === id); return u && !u.dead ? u : null; },
+
+      issue(id, cmd) {
+        const u = units.find(x => x.id === id);
+        if (!u || u.dead || u.side !== 'player') return false;
+        if (u.order === 'reserve') return false;
+        if (cmd === 'turn') {
+          const th = sim._nearestEnemy(u);
+          if (th) { u.faceTo = th; u.orderState = '正在执行'; }
+          return true;
+        }
+        u.order = cmd; u.orderState = '已收到';
+        return true;
+      },
+      deployReserve() {
+        const r = units.find(u => u.reserve && u.side === 'player' && !u.dead && u.order === 'reserve');
+        if (!r) return false;
+        r.order = 'hold'; r.reserve = false; r.orderState = '已收到';
+        sim.events.push({ kind: 'sugg', text: r.name + ' 已投入，向东岸缺口展开。' });
+        return true;
+      },
+      _nearestEnemy(u) {
+        let best = null, bd = 1e9;
+        units.forEach(o => { if (o.side !== u.side && !o.dead && !o.routed) { const d = Math.hypot(u.x - o.x, u.z - o.z); if (d < bd) { bd = d; best = o; } } });
+        return best;
+      },
+
+      step(dt) {
+        if (sim.ended) return null;
+        sim.time += dt;
+        sim._alertT -= dt;
+        units.forEach(u => sim._stepUnit(u, dt));
+        sim._checkThreats();
+        return sim.checkEnd();
+      },
+
+      _stepUnit(u, dt) {
+        if (u.dead) return;
+        if (u.routed) {
+          const dir = u.side === 'player' ? -1 : 1;
+          u.x += dir * 8 * dt;
+          u.moving = true;
+          return;
+        }
+        // 弩手东岸位统计（假设对照用）
+        if (u.id === 'p3') { sim._p3AllT += dt; if (u.x / WORLD.w + 0.5 > NX) sim._p3EastT += dt; }
+
+        let target = null;
+        // 车马疲劳减半生效：辎重车再疲惫也能缓慢挪动，不会彻底瘫痪
+        const moveSpeed = u.speedBase * (1 - u.fatigue / (u.isConvoy ? 400 : 200));
+        const inRiver = isRiverW(u.x, u.z), inShal = isShallowW(u.x, u.z);
+        let sp = moveSpeed;
+        if (inRiver) sp *= 0.35;
+        if (inShal) sp *= 0.6;
+        if (sim._inWoods(u.x, u.z)) sp *= 0.7;
+
+        const cv = sim.convoy();
+        if (u.side === 'player') {
+          if (u.isConvoy) {
+            const wp = WAYPOINTS[Math.min(u.wpIdx, WAYPOINTS.length - 1)];
+            target = { x: wp.x, z: wp.z };
+            if (Math.hypot(u.x - wp.x, u.z - wp.z) < 2.5 && u.wpIdx < WAYPOINTS.length - 1) u.wpIdx++;
+            u.moving = true;
+          } else if (u.order === 'escort' && cv && !cv.dead) {
+            const d = Math.hypot(u.x - cv.x, u.z - cv.z);
+            target = d > 8 ? cv : null;
+          } else if (u.order === 'advance') {
+            const e = sim._nearestEnemy(u);
+            if (e && Math.hypot(u.x - e.x, u.z - e.z) > u.range * 0.8) target = e;
+            else if (cv && !cv.dead && Math.hypot(u.x - cv.x, u.z - cv.z) > 14) target = cv;
+          } else if (u.order === 'retreat') {
+            target = { x: 46, z: u.z };
+            if (u.x > 44) { u.orderState = '已撤离'; u.safe = true; u.moving = false; return; }
+          }
+        } else {
+          // 敌方AI：优先攻击拦路晋军，无拦截则直扑粮车
+          let interceptor = null, id = 1e9;
+          units.forEach(o => {
+            if (o.side !== 'player' || o.dead || o.routed || o.isConvoy) return;
+            const d = Math.hypot(u.x - o.x, u.z - o.z);
+            if (d < 22 && d < id) { id = d; interceptor = o; }
+          });
+          if (interceptor) {
+            target = id > u.range * 0.8 ? interceptor : null;
+          } else if (cv && !cv.dead) {
+            const d = Math.hypot(u.x - cv.x, u.z - cv.z);
+            target = d > u.range * 0.7 ? cv : null;
+            if (u.type === 'cavalry' && d < 26 && d > 10) target = { x: cv.x + 6, z: cv.z + 10 };
+          } else {
+            const e = units.find(x => x.side === 'player' && !x.dead && !x.routed);
+            if (e) target = e;
+          }
+        }
+
+        u.moving = !!target;
+        if (target) {
+          const dx = target.x - u.x, dz = target.z - u.z;
+          const d = Math.hypot(dx, dz) || 1;
+          if (d > 1.2) {
+            const st = sp * dt;
+            let npx = u.x + dx / d * st, npz = u.z + dz / d * st;
+            if (!u.isConvoy) {
+              // 车马沉重：粮车不受推挤，其余队伍限幅避让
+              units.forEach(o => {
+                if (o === u || o.dead) return;
+                const dd = Math.hypot(npx - o.x, npz - o.z);
+                if (dd < 4.5 && dd > 0.01) {
+                  const push = Math.min(4.5 - dd, 1.2) * 0.5;
+                  npx += (npx - o.x) / dd * push;
+                  npz += (npz - o.z) / dd * push;
+                }
+              });
+            }
+            u.x = Math.max(-58, Math.min(58, npx));
+            u.z = Math.max(-49, Math.min(49, npz));
+            u.orderState = '正在执行';
+          } else u.orderState = '已到位';
+        }
+
+        // 交战
+        let gave = 0;
+        units.forEach(o => {
+          if (o.side === u.side || o.dead || o.routed) return;
+          const d = Math.hypot(u.x - o.x, u.z - o.z);
+          if (d < u.range) {
+            const moral = 1 + u.morale / 200;
+            const fatigueF = 1 - u.fatigue / 250;
+            const charge = u.type === 'cavalry' && u.moving ? 1.5 : 1;
+            const dmg = u.dps * moral * fatigueF * charge * dt * 0.5;
+            o.hp -= dmg; o.dmgTaken += dmg; gave += dmg;
+            u.engagedWith = o; o.engagedWith = u;
+          }
+        });
+        if (gave > 0) u.morale = Math.min(100, u.morale + dt * 0.8);
+        const hpFrac = u.hp / u.maxHp;
+        if (hpFrac < 0.5) u.morale -= dt * 1.6;
+        if (hpFrac < 0.25) u.morale -= dt * 3;
+        if (u.fatigue > 70) u.morale -= dt * 0.6;
+        if (inRiver || inShal) u.morale -= dt * 0.9;
+        u.fatigue = Math.min(100, u.fatigue + dt * (u.moving ? 1.1 : 0.25));
+
+        if (u.morale < 25 && !u.routed && !u.isConvoy) {
+          // 车队无士气概念：不溃逃，只可能被摧毁或缓缓前行
+          u.routed = true;
+          sim.events.push({ kind: 'threat', text: `${u.name} 士气崩溃，正脱离战场！` });
+        }
+        if (u.hp <= 0) {
+          u.dead = true; u.hp = 0;
+          if (u.isConvoy) sim.events.push({ kind: 'threat', text: '粮车尽失！辎重已毁。' });
+        }
+      },
+
+      _inWoods(x, z) {
+        const w1 = cfg.terrain.woodsEast, w2 = cfg.terrain.woodsWest;
+        return Math.hypot(x - nx2wx(w1[0]), z - nz2wz(w1[1])) < 0.10 * WORLD.w
+          || Math.hypot(x - nx2wx(w2[0]), z - nz2wz(w2[1])) < 0.08 * WORLD.w;
+      },
+
+      _checkThreats() {
+        if (sim._alertT > 0) return;
+        sim._alertT = 4;
+        const cv = sim.convoy();
+        if (cv && !cv.dead) {
+          const cav = units.find(u => u.side === 'enemy' && u.type === 'cavalry' && !u.dead && !u.routed);
+          if (cav && Math.hypot(cav.x - cv.x, cav.z - cv.z) < 20)
+            sim.events.push({ kind: 'threat', text: '敌骑兵正迂回粮车！速令一队拦截。' });
+          if (isRiverW(cv.x, cv.z) || isShallowW(cv.x, cv.z)) {
+            sim.stage = Math.max(sim.stage, 1);
+            if (!cv.warned) { sim.events.push({ kind: 'threat', text: '运输队正在渡河——队列散乱，辎重易受袭。' }); cv.warned = true; }
+          }
+          if (cv.x < (cfg.exitZone.x1 - 0.5) * WORLD.w + 8) sim.stage = 2;
+        }
+        const arch = sim.live('p3');
+        if (arch && (isRiverW(arch.x, arch.z) || isShallowW(arch.x, arch.z)))
+          sim.events.push({ kind: 'sugg', text: '建议：弩手渡河则失林缘之利，宜撤回东岸。' });
+      },
+
+      checkEnd() {
+        const cv = sim.convoy();
+        const crossed = cv ? cv.x < RIVERWX + 2 : false;   // 已越过河心为「确已渡河」
+        if (cv && !cv.dead && cv.hp > 0 && cv.x < WINX)
+          return sim._finish(true, '运输队安然渡过淝水，粮道复通。');
+        const players = units.filter(u => u.side === 'player');
+        const combat = players.filter(u => !u.isConvoy);
+        if (!cv || cv.dead) return sim._finish(false, '运输队毁于渡口，粮道中断。');
+        if (combat.length && combat.every(u => u.dead || u.routed || u.safe)) {
+          if (crossed) return sim._finish(true, '掩护部队虽尽，粮车竟得全而退——虽胜犹惋。');
+          return sim._finish(false, '掩护尽没，粮车滞留东岸，终为敌所获。');
+        }
+        if (sim.time > cfg.timeLimit)
+          return sim._finish(cv && !cv.dead && cv.hp > 0 && crossed, crossed ? '时限已至，按预案由都督自动结算（委任结果）。' : '时限已至，粮车未及渡河，都督收兵再图。');
+        return null;
+      },
+
+      _finish(win, text) {
+        if (sim.ended) return null;
+        sim.ended = true;
+        const lossDetail = { player: { infantry: 0, cavalry: 0, archer: 0, convoy: 0 }, enemy: { cavalry: 0, infantry: 0, archer: 0 } };
+        units.forEach(u => {
+          const l = Math.round(u.dmgTaken);
+          if (u.side === 'player') {
+            if (u.isConvoy) lossDetail.player.convoy += l;
+            else if (u.type === 'archer') lossDetail.player.archer += l;
+            else if (u.type === 'cavalry') lossDetail.player.cavalry += l;
+            else lossDetail.player.infantry += l;
+          } else {
+            if (u.type === 'cavalry') lossDetail.enemy.cavalry += l;
+            else if (u.type === 'archer') lossDetail.enemy.archer += l;
+            else lossDetail.enemy.infantry += l;
+          }
+        });
+        const playerTotal = lossDetail.player.infantry + lossDetail.player.cavalry + lossDetail.player.archer + lossDetail.player.convoy;
+        const enemyTotal = lossDetail.enemy.cavalry + lossDetail.enemy.infantry + lossDetail.enemy.archer;
+        const cv = sim.convoy();
+        const convoyHp = cv ? Math.max(0, cv.hp / cv.maxHp) : 0;
+        const enemyInit = cfg.enemyUnits.reduce((s, u) => s + u.strength, 0);
+        const enemyAlive = units.filter(u => u.side === 'enemy' && !u.dead).reduce((s, u) => s + u.hp, 0);
+        const result = {
+          win, text,
+          losses: { player: playerTotal, enemy: enemyTotal },
+          lossDetail,
+          wounded: Math.round(playerTotal * 0.25),
+          convoyHp, grainLoad: sim.grainLoad,
+          time: Math.round(sim.time),
+          archerEast: sim._p3EastT / sim._p3AllT,
+          assumptions: [
+            { k: '「敌约三千，无浮桥」', ok: enemyInit < 2400, note: enemyInit < 2400 ? '与侦报相符' : '实测敌锋较侦报更多，情报低估' },
+            { k: '「浅滩可快速通过」', ok: convoyHp > 0.4, note: convoyHp > 0.4 ? '浅滩通过顺利' : '浅滩一度受阻，辎重损失明显' },
+            { k: '「林缘可覆盖渡口」', ok: sim._p3EastT / sim._p3AllT > 0.6, note: sim._p3EastT / sim._p3AllT > 0.6 ? '弩手保持东岸位，火力覆盖实现' : '弩手脱离掩护位，火力中断' },
+          ],
+        };
+        return result;
+      },
+    };
+    return sim;
   }
+
+  /* ═══════════════ 战略输入推导 ═══════════════ */
+  function deriveInput(S) {
+    const b = S.legions.beifu, t = S.legions.transport;
+    return {
+      morale: b ? b.morale : 70,
+      fatigue: b ? b.fatigue : 15,
+      infantry: b ? b.infantry : 0,
+      cavalry: b ? b.cavalry : 0,
+      archer: b ? b.archer : 0,
+      grainLoad: t ? (t.grainLoad || 0) : 0,
+    };
+  }
+  function assessPlayerForce(S) {
+    const i = deriveInput(S);
+    const total = i.infantry + i.cavalry + i.archer;
+    return { total, canLiveCommand: total >= 120, grainLoad: i.grainLoad };
+  }
+
+  /* ═══════════════ 委任：headless 复跑同一模拟器 ═══════════════ */
+  function simulateDelegated(input) {
+    const cfg = D.battleDukou;
+    const sim = createSim(cfg, input);
+    // 都督预案：步弩据东岸浅滩两翼，骑兵迂回拦截，粮车按节点渡河，预备队相机投入
+    sim.issue('p4', 'advance');
+    sim.deployReserve();
+    let result = null;
+    let guard = 0;
+    while (!result && guard++ < 4000) {
+      result = sim.step(0.5);
+    }
+    if (!result) result = sim._finish(sim.convoy() && sim.convoy().hp > 0, '时限已至，按预案由都督自动结算（委任结果）。');
+    result.delegated = true;
+    return result;
+  }
+
+  /* ═══════════════ 交互层（渲染 / 输入 / 计时） ═══════════════ */
+  let renderer, scene, camera, canvas, raycaster;
+  let sim = null, cfg = null, view = null;
+  let running = false, paused = false, speed = 1, lastSpeed = 1;
+  let selected = null, onResult = null, raf = 0, alive = false, ended = false;
+  let labelHost, alerts = [], lastResult = null;
+  let _clock = performance.now();
+
   function mulberry32(a) {
     return function () {
       a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -168,14 +376,117 @@ SHL.Battle = (function () {
     };
   }
 
-  /* ═══════════ 单位 ═══════════ */
-  function makeUnit(u, side, opts) {
-    const col = side === 'player' ? D.factions.jin.color : D.factions.qin.color;
-    const g = new THREE.Group();
+  const STAGES = ['第一阶段 · 接敌', '第二阶段 · 抢渡', '第三阶段 · 脱离'];
+
+  function start(opts) {
+    cfg = D.battleDukou;
+    onResult = opts.onResult;
+    const S = SHL.State.current();
+    const input = deriveInput(S);
+    sim = createSim(cfg, input);
+    ended = false; elapsedShownReset(); paused = false; speed = 1; lastSpeed = 1;
+    alerts = []; selected = null; lastResult = null;
+
+    canvas = document.getElementById('bt-gl');
+    labelHost = document.getElementById('bt-labels');
+    labelHost.innerHTML = '';
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xE9E1CB);
+    scene.fog = new THREE.Fog(0xE9E1CB, 60, 190);
+    scene.add(new THREE.HemisphereLight(0xFFF8E8, 0x9A8C6E, 1.15));
+    const sun = new THREE.DirectionalLight(0xFFF2D8, 0.85); sun.position.set(30, 60, 20); scene.add(sun);
+    const fill = new THREE.DirectionalLight(0xF2E8D0, 0.3); fill.position.set(-40, 40, -50); scene.add(fill);
+
+    buildTerrain();
+    view = {};
+    sim.units.forEach(u => { view[u.id] = makeUnitView(u); });
+    camera = new THREE.PerspectiveCamera(44, 2, 0.1, 500);
+    camera.position.set(28, 34, 62);
+    camera.lookAt(0, 0, 0);
+    raycaster = new THREE.Raycaster();
+    bindInput();
+    resize();
+    buildUnitBar();
+    setAlert('敌前锋自西岸渡口以东集结，正寻我粮车。', 'threat');
+    setAlert('建议：弩手据东岸林缘，可覆盖浅滩。', 'sugg');
+    updateGoal();
+    alive = true; running = true;
+    _clock = performance.now();
+    loop();
+  }
+  function elapsedShownReset() { document.getElementById('bt-timer').textContent = '00:00'; }
+
+  /* ── 战场地形（表现） ── */
+  function buildTerrain() {
+    const geo = new THREE.PlaneGeometry(WORLD.w, WORLD.h, 60, 50);
+    geo.rotateX(-Math.PI / 2);
+    const pos = geo.attributes.position;
+    const colors = new Float32Array(pos.count * 3);
+    const cLow = new THREE.Color(0xD5CBAE), cGrass = new THREE.Color(0x9FA489), cSand = new THREE.Color(0xC9BC97);
+    const hill = cfg.terrain.hill;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const isR = isRiverW(x, z), isS = isShallowW(x, z);
+      let y = 0;
+      if (isR) y = -0.6; else if (isS) y = -0.3;
+      const hd = Math.hypot(x - (hill.x - 0.5) * WORLD.w, z - (hill.y - 0.5) * WORLD.h);
+      if (hd < 0.09 * WORLD.w) y = 2.8 * Math.max(0, 1 - hd / (0.09 * WORLD.w));
+      pos.setY(i, y);
+      const c = (isR || isS) ? cSand.clone().lerp(new THREE.Color(0x54768A), 0.6)
+        : cLow.clone().lerp(cGrass, (Math.sin(x / WORLD.w * 40) * Math.cos(z / WORLD.h * 30) + 1) / 2 * 0.5);
+      colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geo.computeVertexNormals();
+    scene.add(new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true })));
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(NW * 2 * WORLD.w + 1, WORLD.h), new THREE.MeshBasicMaterial({ color: 0x47707F, transparent: true, opacity: 0.85, depthWrite: false, side: THREE.DoubleSide }));
+    water.rotation.x = -Math.PI / 2;
+    water.position.set(nx2wx(NX), -0.35, 0);
+    scene.add(water);
+    for (let i = 0; i < 5; i++) {
+      const st = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.5, 2.2), new THREE.MeshLambertMaterial({ color: 0x9C8665 }));
+      st.position.set(nx2wx(NX) + (i % 2 ? 1.4 : -1.4), -0.25, nz2wz(CY) + (i - 2) * 2.2);
+      scene.add(st);
+    }
+    const tgeo = new THREE.ConeGeometry(1.1, 3.4, 5);
+    const tmat = new THREE.MeshLambertMaterial({ color: 0x4A554A, flatShading: true });
+    const inst = new THREE.InstancedMesh(tgeo, tmat, 130);
+    const m4 = new THREE.Matrix4();
+    let k = 0;
+    const rr = mulberry32(cfg.seed);
+    [cfg.terrain.woodsEast, cfg.terrain.woodsWest].forEach(w => {
+      for (let i = 0; i < 65; i++) {
+        const a = rr() * Math.PI * 2, d = Math.sqrt(rr()) * (w === cfg.terrain.woodsEast ? 0.10 : 0.08) * WORLD.w;
+        const x = (w[0] - 0.5) * WORLD.w + Math.cos(a) * d, z = (w[1] - 0.5) * WORLD.h + Math.sin(a) * d * 0.83;
+        if (isRiverW(x, z)) continue;
+        const s = 0.55 + rr() * 0.5;
+        m4.makeScale(s, s, s);
+        m4.setPosition(x, 2.2 * s, z);
+        inst.setMatrixAt(k++, m4);
+      }
+    });
+    inst.count = k;
+    scene.add(inst);
+    const ez = cfg.exitZone;
+    const exitPlane = new THREE.Mesh(new THREE.PlaneGeometry(9, 28), new THREE.MeshBasicMaterial({ color: 0x75816B, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide }));
+    exitPlane.rotation.x = -Math.PI / 2;
+    exitPlane.position.set((ez.x1 - 0.5) * WORLD.w + 4.5, 0.06, ((ez.y1 + ez.y2) / 2 - 0.5) * WORLD.h);
+    scene.add(exitPlane);
+    const exitRing = new THREE.Mesh(new THREE.TorusGeometry(3.4, 0.18, 6, 24), new THREE.MeshBasicMaterial({ color: 0x4F5A4A }));
+    exitRing.rotation.x = Math.PI / 2;
+    exitRing.position.set(exitPlane.position.x, 0.12, exitPlane.position.z);
+    scene.add(exitRing);
+  }
+
+  /* ── 单位视图 ── */
+  function makeUnitView(u) {
+    const col = u.side === 'player' ? D.factions.jin.color : D.factions.qin.color;
     const color = new THREE.Color(col);
-    const isConvoy = !!u.isConvoy;
-    const cnt = u.type === 'wagon' ? 5 : u.reserve ? 9 : 12;
-    const mat = new THREE.MeshLambertMaterial({ color: color.getHex(), flatShading: true });
+    const g = new THREE.Group();
+    const cnt = u.type === 'wagon' ? 5 : u.maxHp > 300 ? 12 : 9;
+    const mat = new THREE.MeshLambertMaterial({ color: color.getHex(), flatShading: true, transparent: u.reserve, opacity: u.reserve ? 0.55 : 1, wireframe: false });
     const geo = new THREE.ConeGeometry(0.5, 1.7, 5);
     const inst = new THREE.InstancedMesh(geo, mat, cnt);
     const m4 = new THREE.Matrix4();
@@ -187,7 +498,7 @@ SHL.Battle = (function () {
       inst.setMatrixAt(i, m4);
     }
     g.add(inst);
-    if (isConvoy) {
+    if (u.isConvoy) {
       for (let i = 0; i < 3; i++) {
         const cart = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.2, 1.5), new THREE.MeshLambertMaterial({ color: 0x7A6448 }));
         cart.position.set(-1 + i * 2.2, 0.7, 2.6);
@@ -198,47 +509,51 @@ SHL.Battle = (function () {
         g.add(wheel);
       }
     }
-    // 旗
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 6, 5), new THREE.MeshLambertMaterial({ color: 0x3A403D }));
     pole.position.set(0, 3, -1.4);
     const flag = new THREE.Mesh(new THREE.PlaneGeometry(2.4, 1.5, 4, 2), new THREE.MeshBasicMaterial({ color: color.getHex(), side: THREE.DoubleSide, transparent: u.reserve, opacity: u.reserve ? 0.55 : 1 }));
     flag.position.set(1.2, 5.2, -1.4);
     g.add(pole); g.add(flag);
-    // 选中环
     const ring = new THREE.Mesh(new THREE.TorusGeometry(3.6, 0.14, 6, 26), new THREE.MeshBasicMaterial({ color: 0x984C3F, transparent: true, opacity: 0 }));
     ring.rotation.x = Math.PI / 2;
     ring.position.y = 0.15;
     g.add(ring);
     scene.add(g);
-
-    const x = (u.start[0] - 0.5) * 120, z = (u.start[1] - 0.5) * 100;
-    g.position.set(x, groundY(u.start[0], u.start[1]), z);
+    g.userData.unitId = u.id;
 
     const label = document.createElement('div');
     label.className = 'map-label legion';
     label.style.borderColor = col;
     label.style.color = col;
-    label.textContent = u.name + ' ' + u.strength;
     labelHost.appendChild(label);
-
-    return {
-      ...u, side, group: g, flag, ring, label,
-      hp: u.strength, maxHp: u.strength,
-      morale: u.morale, fatigue: u.fatigue,
-      order: u.reserve ? 'reserve' : (isConvoy ? 'advance' : 'hold'),
-      orderState: '待命',
-      dest: null, moving: false, routed: false, dead: false,
-      speedBase: u.type === 'cavalry' ? 7.5 : u.type === 'wagon' ? 2.2 : u.type === 'archer' ? 4.6 : 5.4,
-      range: u.type === 'archer' ? 16 : u.type === 'cavalry' ? 5.5 : 6.5,
-      dps: u.type === 'archer' ? 9 : u.type === 'cavalry' ? 14 : 10,
-      engaged: false, engagedWith: null,
-    };
+    return { group: g, flag, ring, label };
   }
 
-  /* ═══════════ 输入 ═══════════ */
+  function syncView() {
+    sim.units.forEach(u => {
+      const v = view[u.id];
+      if (!v) return;
+      if (u.dead) { v.group.visible = false; v.label.style.display = 'none'; return; }
+      v.group.visible = true;
+      v.group.position.set(u.x, groundYW(u.x, u.z, cfg.terrain.hill), u.z);
+      v.group.rotation.y = u.moving && v._lastTarget ? 0 : v.group.rotation.y;
+      v.ring.material.opacity = (u.id === selected && u.side === 'player') ? 0.9 : 0;
+      const t = performance.now() / 1000;
+      v.flag.rotation.y = Math.sin(t * 2 + u.maxHp) * 0.2;
+      v.flag.position.x = 1.2 + Math.sin(t * 2.4) * 0.1;
+      const p = v.group.position;
+      const w = p.clone(); w.y += 7; w.project(camera);
+      const r = canvas.getBoundingClientRect();
+      if (w.z > 1) { v.label.style.display = 'none'; return; }
+      v.label.style.display = 'block';
+      v.label.style.transform = `translate(-50%,-100%) translate(${(w.x * 0.5 + 0.5) * r.width}px,${(-w.y * 0.5 + 0.5) * r.height}px)`;
+      v.label.textContent = u.name + ' ' + Math.max(0, Math.round(u.hp)) + (u.routed ? ' · 溃退' : '');
+    });
+  }
+
+  /* ── 输入 ── */
   function bindInput() {
-    // 战场镜头：滚轮缩放 · 右键环绕
-    const center = new THREE.Vector3(10, 0, 8);
+    const center = new THREE.Vector3(0, 0, 0);
     canvas.addEventListener('contextmenu', e => e.preventDefault());
     let bdrag = false, bx = 0;
     canvas.addEventListener('mousedown', e => { if (e.button === 2) { bdrag = true; bx = e.clientX; } });
@@ -257,16 +572,18 @@ SHL.Battle = (function () {
       camera.position.sub(center).multiplyScalar(f).add(center);
     }, { passive: false });
     canvas.onmousedown = (e) => {
+      if (e.button !== 0) return;
       const r = canvas.getBoundingClientRect();
-      const nx = ((e.clientX - r.left) / r.width) * 2 - 1;
-      const ny = -((e.clientY - r.top) / r.height) * 2 + 1;
-      raycaster.setFromCamera(new THREE.Vector2(nx, ny), camera);
-      const hits = raycaster.intersectObjects(units.filter(u => u.side === 'player' && !u.dead).map(u => u.group), true);
+      const nxp = ((e.clientX - r.left) / r.width) * 2 - 1;
+      const nyp = -((e.clientY - r.top) / r.height) * 2 + 1;
+      raycaster.setFromCamera(new THREE.Vector2(nxp, nyp), camera);
+      const ids = sim.units.filter(u => u.side === 'player' && !u.dead).map(u => u.id);
+      const groups = ids.map(id => view[id].group);
+      const hits = raycaster.intersectObjects(groups, true);
       if (hits.length) {
         let o = hits[0].object;
-        while (o.parent && !units.find(u => u.group === o)) o = o.parent;
-        const u = units.find(x => x.group === o);
-        if (u) { selectUnit(u.id); SHL.Audio.tick(); }
+        while (o.parent && !o.userData.unitId) o = o.parent;
+        if (o && o.userData.unitId) { selectUnit(o.userData.unitId); SHL.Audio.tick(); }
       }
     };
     window.addEventListener('keydown', onKey);
@@ -275,18 +592,17 @@ SHL.Battle = (function () {
     if (!running) return;
     if (e.code === 'Space') { e.preventDefault(); setSpeed(paused ? lastSpeed || 1 : 0); }
   }
-  let lastSpeed = 1;
 
-  /* ═══════════ UI ═══════════ */
+  /* ── UI ── */
   function buildUnitBar() {
     const bar = document.getElementById('bt-units');
     bar.innerHTML = '';
-    units.filter(u => u.side === 'player').forEach(u => {
+    sim.units.filter(u => u.side === 'player').forEach(u => {
       const el = document.createElement('div');
-      el.className = 'bt-unit' + (u.reserve ? ' reserve' : '');
+      el.className = 'bt-unit';
       el.id = 'bu-' + u.id;
       el.innerHTML = `
-        <h5><span>${u.name}</span><span class="u-strength">${u.hp}</span></h5>
+        <h5><span>${u.name}</span><span class="u-strength">${Math.round(u.hp)}</span></h5>
         <div class="u-bars">
           <div class="u-bar m"><i style="width:${u.morale}%"></i></div>
           <div class="u-bar f"><i style="width:${u.fatigue}%"></i></div>
@@ -294,14 +610,13 @@ SHL.Battle = (function () {
         <div class="u-order">${orderLabel(u)}</div>`;
       el.addEventListener('click', () => { selectUnit(u.id); SHL.Audio.tick(); });
       bar.appendChild(el);
-      u.el = el;
     });
     document.getElementById('btc-title').textContent = '军令 —— ' + cfg.commanderName + ' · 护粮都督';
     buildCmdBtns();
   }
   function orderLabel(u) {
-    const map = { hold: '坚守', advance: '推进', escort: '护卫粮车', retreat: '撤退', reserve: '预备队', stuck: '受阻' };
-    const s = u.orderState === '受阻' ? ' · 受阻' : (u.moving ? ' · 正在执行' : u.order !== 'reserve' ? ' · 已收到' : '');
+    const map = { hold: '坚守', advance: '推进', escort: '护卫粮车', turn: '转向', retreat: '撤退', reserve: '预备队' };
+    const s = u.orderState === '受阻' ? ' · 受阻' : (u.moving && u.order !== 'reserve' ? ' · 正在执行' : u.order !== 'reserve' ? ' · 已收到' : '');
     return (map[u.order] || u.order) + (u.order === 'reserve' ? '（未投入）' : s);
   }
 
@@ -330,354 +645,106 @@ SHL.Battle = (function () {
     if (ended) return;
     SHL.Audio.confirm();
     if (cmd === 'deploy') {
-      const res = units.find(u => u.reserve && u.side === 'player' && !u.dead && u.order === 'reserve');
-      if (!res) { setAlert('预备队已全部投入，或已接战。', 'sugg'); return; }
-      res.order = 'hold'; res.reserve = false;
-      res.flag.material.opacity = 1;
-      res.orderState = '已收到';
-      setAlert('预备队·丁营已投入，正向东岸缺口展开。', 'sugg');
+      if (!sim.deployReserve()) setAlert('预备队已全部投入，或已接战。', 'sugg');
       refreshCmdBtns(); refreshUnitBar();
       return;
     }
     if (!selected) { setAlert('先在部队栏或战场中选择一支队伍。', 'sugg'); return; }
-    const u = units.find(x => x.id === selected);
-    if (!u || u.dead) return;
-    if (u.order === 'reserve') { setAlert(u.name + ' 尚为预备队，需先「投入预备队」。', 'sugg'); return; }
-    u.order = cmd === 'turn' ? u.order : cmd;
-    u.orderState = '已收到';
-    if (cmd === 'turn') {
-      const th = nearestEnemy(u);
-      if (th) { u.group.lookAt(th.group.position.x, u.group.position.y, th.group.position.z); u.orderState = '正在执行'; }
-    }
+    const ok = sim.issue(selected, cmd);
+    if (!ok) { const u = sim.units.find(x => x.id === selected); setAlert((u ? u.name : '该队') + ' 尚为预备队，需先「投入预备队」。', 'sugg'); return; }
     refreshCmdBtns(); refreshUnitBar();
   }
   function refreshCmdBtns() {
     document.querySelectorAll('#btc-btns .btn').forEach(b => {
-      b.classList.toggle('selected', selected && b.dataset.cmd === (units.find(x => x.id === selected) || {}).order);
+      const u = sim.units.find(x => x.id === selected);
+      b.classList.toggle('selected', u && b.dataset.cmd === u.order);
     });
   }
   function selectUnit(id) {
     selected = id;
-    units.forEach(u => u.ring.material.opacity = (u.id === id && u.side === 'player') ? 0.9 : 0);
-    refreshCmdBtns();
-    refreshUnitBar();
+    refreshCmdBtns(); refreshUnitBar();
   }
   function refreshUnitBar() {
-    units.filter(u => u.side === 'player').forEach(u => {
-      if (!u.el) return;
-      u.el.querySelector('.u-strength').textContent = Math.round(u.hp);
-      u.el.querySelector('.u-bar.m i').style.width = Math.max(0, u.morale) + '%';
-      u.el.querySelector('.u-bar.f i').style.width = u.fatigue + '%';
-      const o = u.el.querySelector('.u-order');
+    sim.units.filter(u => u.side === 'player').forEach(u => {
+      const el = document.getElementById('bu-' + u.id);
+      if (!el) return;
+      el.querySelector('.u-strength').textContent = Math.max(0, Math.round(u.hp));
+      el.querySelector('.u-bar.m i').style.width = Math.max(0, u.morale) + '%';
+      el.querySelector('.u-bar.f i').style.width = u.fatigue + '%';
+      const o = el.querySelector('.u-order');
       o.textContent = orderLabel(u);
       o.className = 'u-order' + (u.orderState === '受阻' ? ' stuck' : u.moving ? ' exec' : '');
-      u.el.classList.toggle('selected', selected === u.id);
-      u.el.classList.toggle('dead', u.dead);
+      el.classList.toggle('selected', selected === u.id);
+      el.classList.toggle('dead', u.dead);
     });
   }
   function updateGoal() {
     document.getElementById('bt-goal-text').textContent = cfg.objective;
     document.getElementById('bt-goal-opt').textContent = cfg.objectiveOpt;
-    document.getElementById('bt-stage').textContent = STAGES[Math.min(2, stageIdx)];
+    document.getElementById('bt-stage').textContent = STAGES[Math.min(2, sim.stage)];
   }
-
   function setAlert(text, kind) {
     alerts.unshift({ text, kind });
     if (alerts.length > 2) alerts.pop();
-    const box = document.getElementById('bt-intel-list');
-    box.innerHTML = alerts.map(a => `<div class="bt-alert ${a.kind === 'sugg' ? 'sugg' : ''}">${a.text}</div>`).join('');
+    document.getElementById('bt-intel-list').innerHTML =
+      alerts.map(a => `<div class="bt-alert ${a.kind === 'sugg' ? 'sugg' : ''}">${a.text}</div>`).join('');
   }
-
   function setSpeed(v) {
-    if (v === 0) { paused = true; }
+    if (v === 0) paused = true;
     else { paused = false; speed = v; lastSpeed = v; }
-    document.querySelectorAll('.bt-speed').forEach(b => {
-      b.classList.toggle('active', Number(b.dataset.speed) === (paused ? 0 : speed));
-    });
+    document.querySelectorAll('.bt-speed').forEach(b => b.classList.toggle('active', Number(b.dataset.speed) === (paused ? 0 : speed)));
     document.querySelector('.bt-speed[data-speed="0"]').textContent = paused ? '继续 (空格)' : '暂停 (空格)';
   }
 
-  /* ═══════════ 战斗模型（自动处理与亲自指挥共用） ═══════════ */
-  function nearestEnemy(u) {
-    let best = null, bd = 1e9;
-    units.forEach(o => {
-      if (o.side === u.side || o.dead || o.routed) return;
-      const d = u.group.position.distanceTo(o.group.position);
-      if (d < bd) { bd = d; best = o; }
-    });
-    return best;
-  }
-  function convoy() { return units.find(u => u.isConvoy); }
-
-  function stepUnit(u, dt) {
-    if (u.dead) { u.group.visible = false; u.label.style.display = 'none'; return; }
-    if (u.routed) {
-      // 溃退向东（敌方溃兵向西）
-      const dir = u.side === 'player' ? -1 : 1;
-      u.group.position.x += dir * 8 * dt;
-      u.label.textContent = u.name + ' 溃退';
-      u.label.style.opacity = 0.5;
-      syncUnitTransform(u);
-      return;
-    }
-    const nz = u.group.position.z / 100 + 0.5, nx = u.group.position.x / 120 + 0.5;
-    let target = null, moveSpeed = u.speedBase * (1 - u.fatigue / 200);
-
-    // 阵形/地形修正
-    if (isRiver(nx, nz)) moveSpeed *= 0.35;
-    if (isShallow(nx, nz)) moveSpeed *= 0.6;      // 浅滩可通行但减速
-    if (inWoods(nx, nz)) moveSpeed *= 0.7;
-    if (u.type === 'wagon') moveSpeed *= isShallow(nx, nz) ? 0.5 : 1;
-
-    // 行为
-    const cv = convoy();
-    if (u.side === 'player') {
-      if (u.isConvoy) {
-        // 粮车先取浅滩东口，过河后直奔西岸撤离点
-        const nx2 = u.group.position.x / 120 + 0.5;
-        if (nx2 > RIVER.x + RIVER.w) target = { x: -12, z: (CROSS.y - 0.5) * 100 };
-        else target = { x: (cfg.exitZone.x1 - 0.5) * 120 + 3, z: u.group.position.z };
-      } else if (u.order === 'escort' && cv && !cv.dead) {
-        const d = u.group.position.distanceTo(cv.group.position);
-        target = d > 8 ? cv.group.position : null;
-      } else if (u.order === 'advance') {
-        const e = nearestEnemy(u);
-        if (e && u.group.position.distanceTo(e.group.position) > u.range * 0.8) target = e.group.position;
-        else if (cv && !cv.dead && u.group.position.distanceTo(cv.group.position) > 14) target = cv.group.position;
-      } else if (u.order === 'retreat') {
-        target = { x: 46, z: u.group.position.z };
-        if (u.group.position.x > 44) { u.orderState = '已撤离'; u.hp = Math.max(u.hp, 0); u.safe = true; }
-      }
-    } else {
-      // 敌方AI：优先攻击拦路的晋军，无拦截则直扑粮车
-      let interceptor = null, id = 1e9;
-      units.forEach(o => {
-        if (o.side !== 'player' || o.dead || o.routed || o.isConvoy) return;
-        const d = u.group.position.distanceTo(o.group.position);
-        if (d < 22 && d < id) { id = d; interceptor = o; }
-      });
-      if (interceptor) {
-        target = id > u.range * 0.8 ? interceptor.group.position : null;
-      } else if (cv && !cv.dead) {
-        const d = u.group.position.distanceTo(cv.group.position);
-        target = d > u.range * 0.7 ? cv.group.position : null;
-        if (u.type === 'cavalry' && d < 26 && d > 10) {
-          // 迂回侧翼
-          target = { x: cv.group.position.x + 6, z: cv.group.position.z + 10 };
-        }
-      } else {
-        const e = units.find(x => x.side === 'player' && !x.dead && !x.routed);
-        if (e) target = e.group.position;
-      }
-    }
-
-    u.moving = !!target;
-    if (target) {
-      const dx = target.x - u.group.position.x, dz = target.z - u.group.position.z;
-      const d = Math.hypot(dx, dz);
-      if (d > 1.2) {
-        const st = moveSpeed * dt;
-        const npos = u.group.position.clone();
-        npos.x += dx / d * st; npos.z += dz / d * st;
-        // 单位间隔防重叠
-        units.forEach(o => {
-          if (o === u || o.dead) return;
-          const dd = npos.distanceTo(o.group.position);
-          if (dd < 4.5 && dd > 0.01) {
-            npos.x += (npos.x - o.group.position.x) / dd * (4.5 - dd) * 0.5;
-            npos.z += (npos.z - o.group.position.z) / dd * (4.5 - dd) * 0.5;
-          }
-        });
-        u.group.position.x = npos.x; u.group.position.z = npos.z;
-        u.group.position.y = groundY(nx, nz);
-        // 面向
-        u.group.rotation.y = Math.atan2(dx, dz) * -1;
-        u.orderState = '正在执行';
-      } else u.orderState = '已到位';
-    }
-
-    // 交战
-    let took = 0, gave = 0;
-    units.forEach(o => {
-      if (o.side === u.side || o.dead || o.routed) return;
-      const d = u.group.position.distanceTo(o.group.position);
-      if (d < u.range) {
-        const moral = 1 + u.morale / 200;
-        const fatigueF = 1 - u.fatigue / 250;
-        const charge = u.type === 'cavalry' && u.moving ? 1.5 : 1;
-        const dmg = u.dps * moral * fatigueF * charge * dt * 0.5;
-        o.hp -= dmg; gave += dmg;
-        u.engaged = true; u.engagedWith = o;
-        o.engaged = true; o.engagedWith = u;
-      }
-    });
-    // 士气
-    if (gave > 0) u.morale = Math.min(100, u.morale + dt * 0.8);
-    const hpFrac = u.hp / u.maxHp;
-    if (hpFrac < 0.5) u.morale -= dt * 1.6;
-    if (hpFrac < 0.25) u.morale -= dt * 3;
-    if (u.fatigue > 70) u.morale -= dt * 0.6;
-    // 阵形散乱：渡河中士气流失
-    if (isRiver(nx, nz) || isShallow(nx, nz)) u.morale -= dt * 0.9;
-    u.fatigue = Math.min(100, u.fatigue + dt * (u.moving ? 1.1 : 0.25));
-
-    if (u.morale < 25) {
-      u.routed = true;
-      setAlert(`${u.name} 士气崩溃，正脱离战场！`, 'threat');
-      SHL.Audio.alert();
-    }
-    if (u.hp <= 0) {
-      u.dead = true;
-      if (u.side === 'player') playerLosses += u.strength; else enemyLosses += u.strength;
-      if (u.isConvoy) setAlert('粮车尽失！辎重已毁。', 'threat');
-    }
-    syncUnitTransform(u);
-  }
-
-  function syncUnitTransform(u) {
-    const p = u.group.position;
-    u.label.style.transform = `translate(-50%,-100%) translate(${((p.x / 120 + 0.5) * 100).toFixed(1)}%, 0)`;
-    // 用世界坐标投影
-    const v = p.clone(); v.y += 7; v.project(camera);
-    const r = canvas.getBoundingClientRect();
-    if (v.z > 1) { u.label.style.display = 'none'; return; }
-    u.label.style.display = 'block';
-    u.label.style.transform = `translate(-50%,-100%) translate(${(v.x * 0.5 + 0.5) * r.width}px,${(-v.y * 0.5 + 0.5) * r.height}px)`;
-    u.label.textContent = u.name + ' ' + Math.max(0, Math.round(u.hp)) + (u.routed ? ' · 溃退' : '') + (u.dead ? ' · 殁' : '');
-  }
-
-  /* ═══════════ 局部规则军情 ═══════════ */
-  let threatTimer = 0;
-  function checkThreats(dt) {
-    threatTimer -= dt;
-    if (threatTimer > 0) return;
-    threatTimer = 4;
-    const cv = convoy();
-    if (cv && !cv.dead) {
-      const cav = units.find(u => u.side === 'enemy' && u.type === 'cavalry' && !u.dead && !u.routed);
-      if (cav && cav.group.position.distanceTo(cv.group.position) < 20)
-        setAlert('敌骑兵正迂回粮车！速令一队拦截。', 'threat');
-      const nx = cv.group.position.x / 120 + 0.5, nz = cv.group.position.z / 100 + 0.5;
-      if (isRiver(nx, nz)) {
-        stageIdx = Math.max(stageIdx, 1);
-        if (!cv.warned) { setAlert('运输队正在渡河——队列散乱，辎重易受袭。', 'threat'); cv.warned = true; }
-      }
-      if (cv.group.position.x < (cfg.exitZone.x1 - 0.5) * 120 + 8) stageIdx = 2;
-    }
-    // 建议类
-    const arch = units.find(u => u.id === 'p3' && !u.dead);
-    if (arch && isRiver(arch.group.position.x / 120 + 0.5, arch.group.position.z / 100 + 0.5))
-      setAlert('建议：弩手渡河则失林缘之利，宜撤回东岸。', 'sugg');
-  }
-
-  /* ═══════════ 胜负 ═══════════ */
-  function checkEnd() {
-    if (ended) return;
-    const cv = convoy();
-    // 胜：粮车到达撤离区
-    if (cv && !cv.dead && cv.hp > 0 && cv.group.position.x < (cfg.exitZone.x1 - 0.5) * 120 + 5) {
-      finish(true, '运输队安然渡过淝水，粮道复通。');
-      return;
-    }
-    // 负：粮车被毁 或 我方全灭/全溃
-    const players = units.filter(u => u.side === 'player');
-    const combat = players.filter(u => !u.isConvoy);
-    if (!cv || cv.dead) { finish(false, '运输队毁于渡口，粮道中断。'); return; }
-    if (combat.every(u => u.dead || u.routed || u.safe)) {
-      if (cv && !cv.dead) finish(true, '掩护部队虽尽，粮车竟得全而退——虽胜犹惋。');
-      else finish(false, '掩护尽没，粮车不保。');
-      return;
-    }
-    // 时限：按委任自动结算
-    if (elapsed > cfg.timeLimit) {
-      finish(cv && !cv.dead && cv.hp > cv.maxHp * 0.4, '时限已至，按预案由都督自动结算（委任结果）。');
-    }
-  }
-
-  function finish(win, text) {
+  /* ── 结算展示 ── */
+  function showResult(result) {
     ended = true; running = false;
-    // 统计：阵亡 + 溃散（溃散折半计损）
-    const routedEnemy = units.filter(u => u.side === 'enemy' && u.routed).reduce((s, u) => s + Math.max(0, u.hp), 0);
-    const routedPlayer = units.filter(u => u.side === 'player' && u.routed && !u.isConvoy).reduce((s, u) => s + Math.max(0, u.hp), 0);
-    const cv = convoy();
-    const convoyHp = cv ? Math.max(0, cv.hp / cv.maxHp) : 0;
-    playerLosses += routedPlayer * 0.5;
-    enemyLosses += routedEnemy;
-    const wounded = Math.round(playerLosses * 0.3);
-    const result = {
-      win, text,
-      losses: { player: Math.round(playerLosses), enemy: Math.round(enemyLosses) },
-      convoyHp, wounded,
-      time: Math.round(elapsed),
-      assumptions: [],
-    };
     lastResult = result;
-    // 假设对比（军议AI解释）
-    result.assumptions = [
-      { k: '「敌约三千，无浮桥」', ok: enemyStrengthSeen() < 2400, note: enemyStrengthSeen() < 2400 ? '与侦报相符' : '实测敌锋较侦报更多，情报低估' },
-      { k: '「浅滩可快速通过」', ok: !blockedAtCrossing(), note: blockedAtCrossing() ? '浅滩一度受阻，辎重减速明显' : '浅滩通过顺利' },
-      { k: '「林缘可覆盖渡口」', ok: archerHoldEast(), note: archerHoldEast() ? '弩手保持东岸位，火力覆盖实现' : '弩手脱离掩护位，火力中断' },
-    ];
-    const box = document.getElementById('bt-result');
     document.getElementById('btr-body').innerHTML = `
-      <p><b>${text}</b></p>
+      <p><b>${result.text}</b></p>
       <p>用时 ${fmt(result.time)} · 我方伤亡 <b class="num-neg">${result.losses.player}</b> · 敌方伤亡 <b class="num-pos">${result.losses.enemy}</b></p>
-      <p>辎重保存 <b>${Math.round(convoyHp * 100)}%</b> · 伤员 ${wounded} 人</p>
+      <p>辎重保存 <b>${Math.round(result.convoyHp * 100)}%</b> · 伤员 ${result.wounded} 人</p>
       <p class="dim">本结果由战斗规则产生；AI 仅解释原方案假设的成立与否。</p>`;
-    box.classList.remove('hidden');
+    document.getElementById('bt-result').classList.remove('hidden');
     SHL.Audio.turn();
   }
-  function enemyStrengthSeen() { return units.filter(u => u.side === 'enemy' && !u.dead).reduce((s, u) => s + u.hp, 0) + enemyLosses; }
-  function blockedAtCrossing() { return grainSaved < 1 && false; }
-  function archerHoldEast() {
-    const a = units.find(u => u.id === 'p3');
-    return a && !a.dead && (a.group.position.x / 120 + 0.5) > RIVER.x;
-  }
-  function fmt(s) { return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(Math.floor(s % 60)).padStart(2, '0'); }
-
-  /* ═══════════ 主循环 ═══════════ */
-  function loop() {
-    if (!alive) return;
-    raf = requestAnimationFrame(loop);
-    const rawDt = Math.min(0.05, clockDelta());
-    const dt = paused ? 0 : rawDt * speed;
-    if (!ended && dt > 0) {
-      elapsed += dt;
-      units.forEach(u => stepUnit(u, dt));
-      checkThreats(dt);
-      refreshUnitBar();
-      checkEnd();
-      document.getElementById('bt-timer').textContent = fmt(elapsed);
-    }
-    // 旗帜动画
-    const t = performance.now() / 1000;
-    units.forEach(u => {
-      if (!u.dead) { u.flag.rotation.y = Math.sin(t * 2 + u.hp) * 0.2; u.flag.position.x = 1.2 + Math.sin(t * 2.4) * 0.1; }
-    });
-    // 镜头：右键拖拽旋转 + 滚轮
-    renderer.render(scene, camera);
-  }
-  let _clock = performance.now();
-  function clockDelta() {
-    const now = performance.now();
-    const d = (now - _clock) / 1000;
-    _clock = now;
-    return d;
-  }
-
-  /* ═══════════ 结束与回写 ═══════════ */
   document.addEventListener('click', (e) => {
     if (e.target && e.target.id === 'btr-ok') {
-      const box = document.getElementById('bt-result');
-      box.classList.add('hidden');
+      document.getElementById('bt-result').classList.add('hidden');
       alive = false;
       cancelAnimationFrame(raf);
       window.removeEventListener('keydown', onKey);
-      const result = lastResult || { win: false, text: '交锋结束', losses: { player: 0, enemy: 0 }, convoyHp: 0, wounded: 0, time: 0 };
+      const result = lastResult;
       lastResult = null;
-      if (onResult) onResult(result);
+      if (onResult && result) onResult(result);
     }
   });
+  function fmt(s) { return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(Math.floor(s % 60)).padStart(2, '0'); }
+
+  /* ── 主循环 ── */
+  function loop() {
+    if (!alive) return;
+    raf = requestAnimationFrame(loop);
+    const now = performance.now();
+    const rawDt = Math.min(0.05, (now - _clock) / 1000);
+    _clock = now;
+    const dt = paused ? 0 : rawDt * speed;
+    if (!ended && dt > 0) {
+      const result = sim.step(dt);
+      refreshUnitBar();
+      updateGoal();
+      document.getElementById('bt-timer').textContent = fmt(sim.time);
+      // 军情：从模拟事件中取用（每帧最多两条）
+      while (sim.events.length) {
+        const ev = sim.events.shift();
+        setAlert(ev.text, ev.kind);
+        if (ev.kind === 'threat') SHL.Audio.alert();
+      }
+      if (result) { showResult(result); }
+    }
+    syncView();
+    renderer.render(scene, camera);
+  }
 
   function resize() {
     if (!renderer) return;
@@ -689,8 +756,9 @@ SHL.Battle = (function () {
   window.addEventListener('resize', resize);
 
   return {
-    start, resize,
-    setSpeed,
+    start, resize, setSpeed,
+    simulateDelegated, deriveInput, assessPlayerForce,
+    _createSim: createSim,   // 调试与测试用
     get running() { return running; },
   };
 })();
